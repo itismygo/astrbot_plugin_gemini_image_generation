@@ -4,6 +4,8 @@
 遵循官方 API 规范，支持任意模型名称和自定义 API base（反代）
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import re
@@ -231,7 +233,7 @@ class GeminiAPIClient:
         return url, headers, payload
 
     async def generate_image(
-        self, config: ApiRequestConfig, max_retries: int = 3
+        self, config: ApiRequestConfig, max_retries: int = 3, total_timeout: int = 120
     ) -> tuple[str | None, str | None, str | None]:
         """
         生成图像
@@ -239,6 +241,7 @@ class GeminiAPIClient:
         Args:
             config: 请求配置
             max_retries: 最大重试次数
+            total_timeout: 总超时时间（秒）
 
         Returns:
             (image_url, image_path, text_content) 或 (None, None, None) 如果失败
@@ -270,6 +273,7 @@ class GeminiAPIClient:
             api_type=config.api_type,
             model=config.model,
             max_retries=max_retries,
+            total_timeout=total_timeout,
         )
 
     async def _make_request(
@@ -280,45 +284,87 @@ class GeminiAPIClient:
         api_type: str,
         model: str,
         max_retries: int,
+        total_timeout: int = 120,
     ) -> tuple[str | None, str | None, str | None]:
-        """执行 API 请求并处理响应"""
+        """执行 API 请求并处理响应，每个重试有独立的超时控制"""
 
         current_retry = 0
         last_error = None
 
         while current_retry < max_retries:
             try:
-                # 完全让框架控制超时时间，避免任何时间冲突
+                # 每个重试使用独立的超时控制，不共享总超时时间
                 async with aiohttp.ClientSession() as session:
-                    logger.debug("使用框架默认超时控制")
-                    return await self._perform_request(
-                        session, url, payload, headers, api_type, model
+                    logger.debug(f"发送请求（重试 {current_retry + 1}/{max_retries}）")
+                    return await asyncio.wait_for(
+                        self._perform_request(session, url, payload, headers, api_type, model),
+                        timeout=total_timeout
                     )
 
-            except asyncio.TimeoutError:
-                last_error = APIError("请求超时", None, "timeout")
-                logger.warning(f"请求超时 (重试 {current_retry + 1}/{max_retries})")
             except asyncio.CancelledError:
-                # 处理框架取消错误，不重试
-                logger.debug("请求被框架取消（超时限制），这通常是正常的")
+                # 只有框架取消才不重试（这是最顶层的超时）
+                logger.debug("请求被框架取消（工具调用总超时），不再重试")
                 timeout_msg = "图像生成时间过长，超出了框架限制。请尝试简化图像描述或在框架配置中增加 tool_call_timeout 到 90-120 秒。"
                 raise APIError(timeout_msg, None, "cancelled")
             except Exception as e:
-                last_error = APIError(str(e), None, "network")
-                logger.warning(f"网络错误: {e}")
+                error_msg = str(e)
+                error_type = self._classify_error(e, error_msg)
 
-            current_retry += 1
+                # 判断是否可重试的错误
+                if self._is_retryable_error(error_type, e):
+                    last_error = APIError(error_msg, None, error_type)
+                    logger.warning(f"可重试错误 (重试 {current_retry + 1}/{max_retries}): {error_msg}")
 
-            if current_retry < max_retries:
-                delay = min(2**current_retry, 10)
-                logger.debug(f"等待 {delay} 秒后重试...")
-                await asyncio.sleep(delay)
+                    current_retry += 1
+                    if current_retry < max_retries:
+                        # 指数退避延迟：2秒、4秒、8秒……最大10秒
+                        delay = min(2 ** (current_retry + 1), 10)
+                        logger.debug(f"等待 {delay} 秒后重试...")
+                        await asyncio.sleep(delay)
+                        continue  # 继续下一次重试
+                    else:
+                        logger.error(f"达到最大重试次数 ({max_retries})，生成失败")
+                else:
+                    # 不可重试的错误，立即抛出
+                    logger.error(f"不可重试错误: {error_msg}")
+                    raise APIError(error_msg, None, error_type)
 
-        logger.error(f"达到最大重试次数 ({max_retries})，生成失败")
+        # 如果都失败了，返回最后一次错误
         if last_error:
             raise last_error
 
-        return None, None, None, None, None
+        return None, None, None
+
+    def _classify_error(self, exception: Exception, error_msg: str) -> str:
+        """分类错误类型"""
+        if isinstance(exception, asyncio.TimeoutError):
+            return "timeout"
+        elif "timeout" in error_msg.lower():
+            return "timeout"
+        elif "connection" in error_msg.lower():
+            return "network"
+        elif isinstance(exception, aiohttp.ClientError):
+            return "network"
+        else:
+            return "unknown"
+
+    def _is_retryable_error(self, error_type: str, exception: Exception) -> bool:
+        """判断错误是否可重试"""
+        # 可重试的错误：超时、网络错误、服务器错误
+        if error_type in ["timeout", "network"]:
+            return True
+
+        # HTTP 状态码判断
+        if hasattr(exception, "status"):
+            status = exception.status
+            # 可重试：408, 500, 502, 503, 504
+            # 不可重试：401, 402, 403, 422, 429（速率限制）
+            if status in [408, 500, 502, 503, 504]:
+                return True
+            elif status in [401, 402, 403, 422, 429]:
+                return False
+
+        return True  # 默认重试未知错误
 
     async def _perform_request(
         self,
@@ -401,8 +447,9 @@ class GeminiAPIClient:
         image_path = None
         text_content = None
 
-        logger.debug("🖼️ 搜索图像数据...")
+        logger.debug(f"🖼️ 搜索图像数据... (共 {len(parts)} 个part)")
         for i, part in enumerate(parts):
+            logger.debug(f"检查第 {i} 个part: {list(part.keys())}")
             if "inlineData" in part and not part.get("thought", False):
                 inline_data = part["inlineData"]
                 mime_type = inline_data.get("mimeType", "image/png")
@@ -431,11 +478,17 @@ class GeminiAPIClient:
 
                     if image_path:
                         image_url = f"file://{Path(image_path).absolute()}"
+                else:
+                    logger.warning(f"第 {i} 个part有inlineData但data为空")
+            elif "thought" in part and part.get("thought", False):
+                logger.debug(f"第 {i} 个part是思考内容")
+            else:
+                logger.debug(f"第 {i} 个part不是图像也不是思考: {list(part.keys())}")
 
         # 查找文本内容
         logger.debug("📝 搜索文本内容...")
         text_parts = [
-            p for p in parts if "text" in p and not part.get("thought", False)
+            p for p in parts if "text" in p and not p.get("thought", False)
         ]
         if text_parts:
             text_content = " ".join([p["text"] for p in text_parts])

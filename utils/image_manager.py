@@ -3,10 +3,20 @@
 统一管理图片的保存和清理
 """
 
+import asyncio
+import base64
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import aiohttp
+
 from astrbot.api import logger
+from astrbot.api.star import StarTools
+
+
+def get_plugin_data_dir() -> Path:
+    """获取插件数据目录"""
+    return StarTools.get_data_dir("AstrBot_plugin_gemini_image_generation")
 
 
 async def cleanup_old_images(images_dir: Path | None = None):
@@ -19,7 +29,7 @@ async def cleanup_old_images(images_dir: Path | None = None):
     try:
         # 默认路径：插件根目录下的 images 文件夹
         if images_dir is None:
-            images_dir = Path(__file__).parent.parent / "images"
+            images_dir = get_plugin_data_dir() / "images"
 
         if not images_dir.exists():
             return
@@ -60,6 +70,132 @@ async def cleanup_old_images(images_dir: Path | None = None):
         logger.error(f"图像清理过程出错: {e}")
 
 
+async def download_qq_avatar(
+    user_id: str, cache_name: str, images_dir: Path | None = None
+) -> str | None:
+    """
+    下载QQ头像并转换为base64格式
+
+    Args:
+        user_id (str): QQ用户ID
+        cache_name (str): 缓存文件名前缀
+        images_dir (Path): images目录路径，如果为None则使用默认路径
+
+    Returns:
+        str: base64格式的头像数据，失败返回None
+    """
+    try:
+        # 默认路径
+        if images_dir is None:
+            images_dir = get_plugin_data_dir() / "images"
+
+        cache_dir = images_dir / "avatar_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        avatar_file = cache_dir / f"{cache_name}_avatar.jpg"
+
+        # 检查缓存
+        if avatar_file.exists() and avatar_file.stat().st_size > 1000:
+            with open(avatar_file, "rb") as f:
+                cached_data = f.read()
+            base64_data = base64.b64encode(cached_data).decode("utf-8")
+            logger.debug(f"使用缓存的头像: {avatar_file}")
+            return f"data:image/jpeg;base64,{base64_data}"
+
+        # 下载头像
+        avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
+        logger.debug(f"获取QQ头像URL: {avatar_url}")
+
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(avatar_url) as response:
+                if response.status != 200:
+                    logger.debug(f"下载头像失败: HTTP {response.status}")
+                    return None
+
+                image_data = await response.read()
+
+                # 检查是否是有效图片（过滤默认头像）
+                if len(image_data) < 1000:
+                    logger.debug("头像文件过小，可能是默认头像，跳过")
+                    return None
+
+                # 保存到缓存
+                with open(avatar_file, "wb") as f:
+                    f.write(image_data)
+                logger.debug(f"头像已缓存: {avatar_file} ({len(image_data)} bytes)")
+
+                base64_data = base64.b64encode(image_data).decode("utf-8")
+                return f"data:image/jpeg;base64,{base64_data}"
+
+    except asyncio.TimeoutError:
+        logger.debug(f"下载头像超时: {user_id}")
+        return None
+    except Exception as e:
+        logger.debug(f"下载转换头像失败: {e}")
+        return None
+
+
+async def cleanup_avatar_cache(cache_name: str, images_dir: Path | None = None):
+    """
+    清理指定的头像缓存文件
+
+    Args:
+        cache_name (str): 要清理的缓存文件名前缀
+        images_dir (Path): images目录路径，如果为None则使用默认路径
+    """
+    try:
+        if images_dir is None:
+            images_dir = get_plugin_data_dir() / "images"
+
+        cache_dir = images_dir / "avatar_cache"
+        if not cache_dir.exists():
+            return
+
+        patterns = [
+            f"{cache_name}_avatar.jpg",
+            f"{cache_name}_avatar.jpeg",
+            f"{cache_name}_avatar.png",
+        ]
+        cleaned_count = 0
+
+        for pattern in patterns:
+            for file_path in cache_dir.glob(pattern):
+                try:
+                    file_path.unlink()
+                    cleaned_count += 1
+                    logger.debug(f"已清理头像缓存: {file_path.name}")
+                except Exception as e:
+                    logger.warning(f"清理头像缓存文件 {file_path} 时出错: {e}")
+
+        if cleaned_count > 0:
+            logger.debug(f"共清理 {cleaned_count} 个头像缓存文件")
+
+    except Exception as e:
+        logger.error(f"头像缓存清理过程出错: {e}")
+
+
+class AvatarManager:
+    """头像管理器，统一管理头像的获取、使用和清理"""
+
+    def __init__(self, images_dir: Path | None = None):
+        self.images_dir = images_dir or get_plugin_data_dir() / "images"
+        self.used_avatars = []  # 记录本次使用的头像缓存名称
+
+    async def get_avatar(self, user_id: str, cache_name: str) -> str | None:
+        """获取头像并记录使用"""
+        avatar_data = await download_qq_avatar(user_id, cache_name, self.images_dir)
+        if avatar_data:
+            self.used_avatars.append(cache_name)
+        return avatar_data
+
+    async def cleanup_used_avatars(self):
+        """清理所有使用过的头像缓存"""
+        for cache_name in self.used_avatars:
+            await cleanup_avatar_cache(cache_name, self.images_dir)
+        self.used_avatars.clear()
+        logger.debug("已清理本次使用的所有头像缓存")
+
+
 async def save_image_data(
     image_data: bytes, image_format: str, images_dir: Path | None = None
 ) -> str | None:
@@ -77,7 +213,7 @@ async def save_image_data(
     try:
         # 默认路径：插件根目录下的 images 文件夹
         if images_dir is None:
-            images_dir = Path(__file__).parent.parent / "images"
+            images_dir = get_plugin_data_dir() / "images"
 
         images_dir.mkdir(exist_ok=True)
 
@@ -138,9 +274,10 @@ async def file_to_base64(file_path: str) -> str | None:
         str: base64 编码的图片数据（带 data URI scheme），失败返回 None
     """
     try:
-        import aiohttp
         import base64
         from urllib.parse import urlparse
+
+        import aiohttp
 
         # 判断是 URL 还是本地文件
         parsed = urlparse(file_path)
