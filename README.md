@@ -2,10 +2,7 @@
 
 <div align="center">
 
-![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue)
-![Version](https://img.shields.io/badge/Version-1.0.0-green)
 ![License](https://img.shields.io/badge/License-MIT-orange)
-![Author](https://img.shields.io/badge/Author-piexian-purple)
 
 **🎨 强大的 Gemini 图像生成插件，支持智能头像参考和多模式生成**
 
