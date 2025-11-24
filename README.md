@@ -363,7 +363,7 @@
 - [NapCat](https://napneko.github.io/) - OneBot v11 实现
 
 **特别感谢贡献者**:
-- [@exynos967](https://github.com/exynos967) - 访问控制功能和代码优化
+- [@exynos967](https://github.com/exynos967) - 限制/限流设置和手办化功能
 
 ## 📞 联系支持
 
