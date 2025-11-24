@@ -1,4 +1,4 @@
-# AstrBot Gemini 图像生成插件 v1.1.0
+# AstrBot Gemini 图像生成插件 v1.2.0
 
 <div align="center">
 
