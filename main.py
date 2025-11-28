@@ -9,9 +9,12 @@ import asyncio
 import base64
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import aiohttp
+import yaml
 from astrbot.api import logger
 from astrbot.api.all import Image, Reply
 from astrbot.api.event import AstrMessageEvent, filter
@@ -50,7 +53,7 @@ from .tl.tl_utils import (
     "astrbot_plugin_gemini_image_generation",
     "piexian",
     "Gemini图像生成插件，支持生图和改图，可以自动获取头像作为参考",
-    "v1.5.0",
+    "v1.5.1",
 )
 class GeminiImageGenerationPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any]):
@@ -488,8 +491,6 @@ class GeminiImageGenerationPlugin(Star):
             """将图片源转换为base64格式"""
             try:
                 if img_source.startswith(("http://", "https://")):
-                    import aiohttp
-
                     async with aiohttp.ClientSession() as session:
                         async with session.get(
                             img_source, timeout=aiohttp.ClientTimeout(total=10)
@@ -1115,6 +1116,10 @@ class GeminiImageGenerationPlugin(Star):
             if use_avatar:
                 avatar_reference = await self.get_avatar_reference(event)
 
+            sent_success = False
+            split_files: list[str] = []
+            image_path = None
+
             success, result_data = await self._generate_image_core_internal(
                 event=event,
                 prompt=full_prompt,
@@ -1122,50 +1127,53 @@ class GeminiImageGenerationPlugin(Star):
                 avatar_reference=avatar_reference,
             )
 
-            if success and result_data:
-                image_path, text_content, thought_signature = result_data
+            if not success or not isinstance(result_data, tuple):
+                error_msg = result_data if isinstance(result_data, str) else "❌ 图像生成失败，请稍后重试"
+                yield event.plain_result(error_msg)
+                return
 
-                # 1. 切割图片
-                yield event.plain_result("✂️ 正在切割图片...")
-                try:
-                    split_files = await asyncio.to_thread(
-                        split_image, image_path, rows=6, cols=4
-                    )
-                except Exception as e:
-                    logger.error(f"切割图片时发生异常: {e}")
-                    split_files = []
+            image_path, text_content, thought_signature = result_data
 
-                if not split_files:
-                    yield event.plain_result("❌ 图片切割失败")
-                    yield event.image_result(image_path)
-                    return
+            # 1. 切割图片
+            yield event.plain_result("✂️ 正在切割图片...")
+            try:
+                split_files = await asyncio.to_thread(
+                    split_image, image_path, rows=6, cols=4
+                )
+            except Exception as e:
+                logger.error(f"切割图片时发生异常: {e}")
+                split_files = []
 
-                # 2. 准备发送逻辑
-                sent_success = False
+            if not split_files:
+                yield event.plain_result("❌ 图片切割失败")
+                yield event.image_result(image_path)
+                return
 
-                # 如果开启了ZIP，优先尝试发送ZIP
-                if self.enable_sticker_zip:
-                    zip_path = create_zip(split_files)
-                    if zip_path:
-                        try:
-                            from astrbot.api.message_components import File
+            # 2. 准备发送逻辑
 
-                            file_comp = File(
-                                file=zip_path, name=os.path.basename(zip_path)
-                            )
-                            yield event.chain_result([file_comp])
-                            sent_success = True
+            # 如果开启了ZIP，优先尝试发送ZIP
+            if self.enable_sticker_zip:
+                zip_path = create_zip(split_files)
+                if zip_path:
+                    try:
+                        from astrbot.api.message_components import File
 
-                            yield event.image_result(image_path)
-                        except Exception as e:
-                            logger.warning(f"发送ZIP失败: {e}")
-                            yield event.plain_result(
-                                "⚠️ 压缩包发送失败，降级使用合并转发"
-                            )
-                            sent_success = False
-                    else:
-                        yield event.plain_result("❌ 压缩包创建失败，降级使用合并转发")
+                        file_comp = File(
+                            file=zip_path, name=os.path.basename(zip_path)
+                        )
+                        yield event.chain_result([file_comp])
+                        sent_success = True
+
+                        yield event.image_result(image_path)
+                    except Exception as e:
+                        logger.warning(f"发送ZIP失败: {e}")
+                        yield event.plain_result(
+                            "⚠️ 压缩包发送失败，降级使用合并转发"
+                        )
                         sent_success = False
+                else:
+                    yield event.plain_result("❌ 压缩包创建失败，降级使用合并转发")
+                    sent_success = False
 
             # 3. 如果没开启ZIP或者ZIP发送失败，发送合并转发
             if not sent_success:
@@ -1189,8 +1197,6 @@ class GeminiImageGenerationPlugin(Star):
                 )
 
                 yield event.chain_result([node])
-            else:
-                yield event.plain_result(str(result_data))
 
         finally:
             self.resolution = old_resolution
@@ -1238,8 +1244,6 @@ class GeminiImageGenerationPlugin(Star):
             )
 
         try:
-            import yaml
-
             metadata_path = os.path.join(os.path.dirname(__file__), "metadata.yaml")
             with open(metadata_path, encoding="utf-8") as f:
                 metadata = yaml.safe_load(f)
@@ -1248,8 +1252,6 @@ class GeminiImageGenerationPlugin(Star):
             version = "v1.3.0"
 
         try:
-            from datetime import datetime
-
             # 获取主题配置
             service_settings = self.config.get("service_settings", {})
             theme_settings = service_settings.get("theme_settings", {})

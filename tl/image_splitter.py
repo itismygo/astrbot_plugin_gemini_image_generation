@@ -1,16 +1,14 @@
-import logging
-import os
 import zipfile
+from pathlib import Path
 
 from PIL import Image
 
+from astrbot.api import logger
 from .tl_utils import get_plugin_data_dir
-
-logger = logging.getLogger("astrbot")
 
 
 def split_image(
-    image_path: str, rows: int = 6, cols: int = 4, output_dir: str = None
+    image_path: str, rows: int = 6, cols: int = 4, output_dir: str | None = None
 ) -> list[str]:
     """
     将图片切分为指定行列的网格
@@ -41,15 +39,16 @@ def split_image(
             # 如果未指定输出目录，则使用插件的标准数据目录
             if not output_dir:
                 data_dir = get_plugin_data_dir()
-                output_dir = os.path.join(str(data_dir), "split_output")
+                output_dir_path = data_dir / "split_output"
+            else:
+                output_dir_path = Path(output_dir)
 
             # 获取源文件名（不含扩展名和路径）作为子目录，避免文件混淆
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            base_name = Path(image_path).stem
             # 最终存储目录: .../split_output/base_name/
-            final_output_dir = os.path.join(output_dir, base_name)
+            final_output_dir = output_dir_path / base_name
 
-            if not os.path.exists(final_output_dir):
-                os.makedirs(final_output_dir)
+            final_output_dir.mkdir(parents=True, exist_ok=True)
 
             output_files = []
 
@@ -70,11 +69,11 @@ def split_image(
                     # id 从 1 开始，按行优先顺序
                     idx = r * cols + c + 1
                     file_name = f"{base_name}_{idx}.png"
-                    file_path = os.path.join(final_output_dir, file_name)
+                    file_path = final_output_dir / file_name
 
                     # 保存
                     piece.save(file_path, "PNG")
-                    output_files.append(file_path)
+                    output_files.append(str(file_path))
 
             return output_files
 
@@ -83,7 +82,7 @@ def split_image(
         return []
 
 
-def create_zip(files: list[str], output_filename: str = None) -> str:
+def create_zip(files: list[str], output_filename: str | None = None) -> str | None:
     """
     将文件列表打包成zip
 
@@ -99,15 +98,17 @@ def create_zip(files: list[str], output_filename: str = None) -> str:
 
     try:
         if not output_filename:
-            first_file = files[0]
-            dir_path = os.path.dirname(first_file)
-            dir_name = os.path.basename(dir_path)
+            first_file = Path(files[0])
+            dir_path = first_file.parent
+            dir_name = dir_path.name
             # 输出到目录的同级，即 .../split_output/base_name.zip
-            output_filename = os.path.join(os.path.dirname(dir_path), f"{dir_name}.zip")
+            output_filename_path = dir_path.parent / f"{dir_name}.zip"
+            output_filename = str(output_filename_path)
 
         with zipfile.ZipFile(output_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
             for file in files:
-                zipf.write(file, os.path.basename(file))
+                file_path = Path(file)
+                zipf.write(file_path, file_path.name)
 
         return output_filename
     except Exception as e:
