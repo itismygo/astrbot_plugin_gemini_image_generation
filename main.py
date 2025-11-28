@@ -1507,7 +1507,7 @@ class GeminiImageGenerationPlugin(Star):
         is_modification_request = False
         if str(use_reference_images).lower() in {"true", "1", "yes", "y", "是"}:
             reference_images = await self._collect_reference_images(event)
-            is_modification_request = True
+            is_modification_request = bool(reference_images)
 
         avatar_reference = []
 
