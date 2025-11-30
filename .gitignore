@@ -147,3 +147,5 @@ data/
 *.jpg
 *.png
 !logo.png
+.serena
+.claude

@@ -8,9 +8,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -22,8 +24,15 @@ import aiohttp
 from astrbot.api import logger
 
 try:
-    from .tl_utils import get_plugin_data_dir, save_base64_image, save_image_data
+    from .tl_utils import (
+        encode_file_to_base64,
+        get_plugin_data_dir,
+        save_base64_image,
+        save_image_data,
+        save_image_stream,
+    )
 except ImportError:
+    from pathlib import Path
 
     async def save_base64_image(
         base64_data: str, image_format: str = "png"
@@ -36,6 +45,18 @@ except ImportError:
     ) -> str | None:
         """占位符函数"""
         return None
+
+    async def save_image_stream(stream_reader, image_format: str = "png", target_path=None):
+        return None
+
+    def encode_file_to_base64(file_path, chunk_size: int = 65536) -> str:
+        return ""
+
+    def get_plugin_data_dir() -> Path:
+        return Path(".")
+
+
+IMAGE_CACHE_DIR = get_plugin_data_dir() / "images" / "download_cache"
 
 
 @dataclass
@@ -57,6 +78,7 @@ class ApiRequestConfig:
     enable_smart_retry: bool = True  # 智能重试开关
     enable_text_response: bool = False  # 文本响应开关
     force_resolution: bool = False  # 强制传递分辨率参数
+    verbose_logging: bool = False  # 详细日志开关
 
     # 官方文档推荐参数
     temperature: float = 0.7  # 控制生成随机性，0.0-1.0
@@ -78,7 +100,7 @@ class GeminiAPIClient:
     """遵循官方 API 规范的 Gemini API 客户端
 
     特性：
-    - 支持 Google 官方 API 和 OpenRouter API
+    - 支持 Google 官方 API 和 OpenAI API
     - 支持自定义 API Base URL（反代）
     - 支持任意模型名称
     - 遵循官方 Gemini API 规范
@@ -87,8 +109,8 @@ class GeminiAPIClient:
     # Google 官方 API 默认地址
     GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-    # OpenRouter API 默认地址
-    OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+    # OpenAI API 默认地址
+    OPENAI_API_BASE = "https://api.openai.com/v1"
 
     def __init__(self, api_keys: list[str]):
         """
@@ -109,6 +131,7 @@ class GeminiAPIClient:
         if self.proxy:
             logger.debug(f"检测到代理配置，使用代理: {self.proxy}")
         logger.debug(f"API 客户端已初始化，支持 {len(self.api_keys)} 个 API 密钥")
+        self.verbose_logging: bool = False
 
     async def get_next_api_key(self) -> str:
         """获取下一个 API 密钥"""
@@ -135,10 +158,11 @@ class GeminiAPIClient:
         parts = [{"text": config.prompt}]
 
         if config.reference_images:
-            for base64_image in config.reference_images[:14]:
-                mime_type, data = await GeminiAPIClient._normalize_image_input(base64_image)
+            for image_input in config.reference_images[:14]:
+                # 对Google API，所有图像都需要转换为base64
+                mime_type, data = await GeminiAPIClient._normalize_image_input(image_input)
                 if not data:
-                    logger.warning(f"跳过无法识别/读取的参考图像: {type(base64_image)}")
+                    logger.warning(f"跳过无法识别/读取的参考图像: {type(image_input)}")
                     continue
 
                 parts.append({"inlineData": {"mimeType": mime_type, "data": data}})
@@ -238,22 +262,151 @@ class GeminiAPIClient:
         return payload
 
     @staticmethod
-    async def _prepare_openrouter_payload(config: ApiRequestConfig) -> dict[str, Any]:
-        """准备 OpenRouter API 请求负载"""
+    async def _prepare_openai_payload(config: ApiRequestConfig) -> dict[str, Any]:
+        """准备 OpenAI API 请求负载"""
         message_content = [
             {"type": "text", "text": f"Generate an image: {config.prompt}"}
         ]
 
         if config.reference_images:
-            for base64_image in config.reference_images[:6]:
-                mime_type, data = await GeminiAPIClient._normalize_image_input(base64_image)
-                if not data:
-                    logger.warning(f"跳过无法识别/读取的参考图像: {type(base64_image)}")
+            # 本地缓存避免重复处理同一引用图，记录耗时便于性能观察
+            processed_cache: dict[str, dict[str, Any]] = {}
+            supported_exts = {
+                "jpg",
+                "jpeg",
+                "png",
+                "webp",
+                "gif",
+                "bmp",
+                "tif",
+                "tiff",
+                "heic",
+                "avif",
+            }
+            total_start = time.perf_counter()
+
+            for idx, image_input in enumerate(config.reference_images[:6]):
+                per_start = time.perf_counter()
+                image_str = str(image_input).strip()
+                if not image_str:
+                    logger.warning(f"跳过空白参考图像: idx={idx}")
                     continue
 
-                image_str = f"data:{mime_type};base64,{data}"
-                message_content.append(
-                    {"type": "image_url", "image_url": {"url": image_str}}
+                if "&amp;" in image_str:
+                    image_str = image_str.replace("&amp;", "&")
+
+                # 命中缓存直接复用，避免重复 base64 处理
+                if image_str in processed_cache:
+                    logger.debug(f"参考图像命中缓存: idx={idx}")
+                    message_content.append(processed_cache[image_str])
+                    continue
+
+                parsed = urllib.parse.urlparse(image_str)
+                image_payload: dict[str, Any] | None = None
+
+                try:
+                    # 优先处理 http(s) URL，确保 scheme 和 netloc 合法
+                    if parsed.scheme in ("http", "https") and parsed.netloc:
+                        ext = Path(parsed.path).suffix.lower().lstrip(".")
+                        if ext and ext not in supported_exts:
+                            logger.debug(
+                                "参考图像URL扩展名不在常见列表: idx=%s ext=%s url=%s",
+                                idx,
+                                ext,
+                                image_str[:80],
+                            )
+
+                        image_payload = {
+                            "type": "image_url",
+                            "image_url": {"url": image_str},
+                        }
+                        logger.debug(
+                            "OpenAI兼容API使用URL参考图: idx=%s ext=%s url=%s",
+                            idx,
+                            ext or "unknown",
+                            image_str[:120],
+                        )
+
+                    # data URL：直接校验 base64，有效则不再重复转码
+                    elif image_str.startswith("data:image/") and ";base64," in image_str:
+                        header, _, data_part = image_str.partition(";base64,")
+                        mime_type = header.replace("data:", "").lower()
+                        try:
+                            base64.b64decode(data_part, validate=True)
+                        except (binascii.Error, ValueError) as e:
+                            logger.warning(
+                                "跳过无效的 data URL 参考图: idx=%s 错误=%s", idx, e
+                            )
+                            mime_type = None
+
+                        if mime_type:
+                            ext = mime_type.split("/")[-1]
+                            if ext and ext not in supported_exts:
+                                logger.debug(
+                                    "data URL 图片格式不常见: idx=%s mime=%s", idx, mime_type
+                                )
+                            image_payload = {
+                                "type": "image_url",
+                                "image_url": {"url": image_str},
+                            }
+                            logger.debug(
+                                "OpenAI兼容API使用data URL参考图: idx=%s mime=%s",
+                                idx,
+                                mime_type,
+                            )
+
+                    # 其他输入交给规范化逻辑，自动转换为 data URL
+                    else:
+                        mime_type, data = await GeminiAPIClient._normalize_image_input(
+                            image_input
+                        )
+                        if not data:
+                            logger.warning(
+                                "跳过无法识别/读取的参考图像: idx=%s type=%s",
+                                idx,
+                                type(image_input),
+                            )
+                            continue
+
+                        if not mime_type or not mime_type.startswith("image/"):
+                            logger.debug(
+                                "未检测到明确的图片 MIME，默认使用 image/png: idx=%s",
+                                idx,
+                            )
+                            mime_type = "image/png"
+
+                        ext = mime_type.split("/")[-1]
+                        if ext and ext not in supported_exts:
+                            logger.debug(
+                                "规范化后图片格式不常见: idx=%s mime=%s", idx, mime_type
+                            )
+
+                        image_payload = {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{data}"},
+                        }
+
+                    if image_payload:
+                        message_content.append(image_payload)
+                        processed_cache[image_str] = image_payload
+                        elapsed_ms = (time.perf_counter() - per_start) * 1000
+                        logger.debug(
+                            "参考图像处理完成: idx=%s 耗时=%.2fms 来源=%s",
+                            idx,
+                            elapsed_ms,
+                            parsed.scheme or "normalized",
+                        )
+                except Exception as e:
+                    logger.warning("处理参考图像时出现异常: idx=%s err=%s", idx, e)
+                    continue
+
+            total_elapsed_ms = (time.perf_counter() - total_start) * 1000
+            if processed_cache:
+                logger.debug(
+                    "参考图像处理统计: 总数=%s 总耗时=%.2fms 平均=%.2fms",
+                    len(processed_cache),
+                    total_elapsed_ms,
+                    total_elapsed_ms / len(processed_cache),
                 )
 
         # OpenAI 兼容接口下：
@@ -325,32 +478,191 @@ class GeminiAPIClient:
                 if image_path.exists() and image_path.is_file():
                     suffix = image_path.suffix.lower().lstrip(".") or "png"
                     mime_type = f"image/{suffix}"
-                    with open(image_path, "rb") as f:
-                        data_bytes = f.read()
-                    data = base64.b64encode(data_bytes).decode("utf-8")
-                    return mime_type, data
+                    try:
+                        data = encode_file_to_base64(image_path)
+                        return mime_type, data
+                    except Exception as e:
+                        logger.warning(f"读取 file:// 路径失败: {e}")
                 else:
                     logger.warning(f"file:// 路径不存在: {image_str}")
 
-            # http(s) URL -> 下载并转base64
+            # http(s) URL -> 下载并转base64（带重试和详细日志）
             if image_str.startswith("http://") or image_str.startswith("https://"):
+                cleaned_url = image_str.replace("&amp;", "&")
+                parsed_url = urllib.parse.urlparse(cleaned_url)
+
+                # 缓存命中直接读取，避免重复下载和内存占用
                 try:
-                    timeout = aiohttp.ClientTimeout(total=8)
-                    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                        async with session.get(image_str) as resp:
-                            if resp.status == 200:
-                                content_type = resp.headers.get("Content-Type", "image/png")
-                                mime_type = (
-                                    content_type.split(";")[0] if content_type else "image/png"
-                                )
-                                data_bytes = await resp.read()
-                                if data_bytes:
-                                    data = base64.b64encode(data_bytes).decode("utf-8")
-                                    return mime_type, data
-                            else:
-                                logger.warning(f"下载图片失败: HTTP {resp.status}")
+                    cache_key = hashlib.sha256(cleaned_url.encode("utf-8")).hexdigest()
+                    IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    cached = next(IMAGE_CACHE_DIR.glob(f"{cache_key}.*"), None)
+                    if cached and cached.exists() and cached.stat().st_size > 0:
+                        mime_guess = f"image/{cached.suffix.lstrip('.') or 'png'}"
+                        data = encode_file_to_base64(cached)
+                        logger.debug(f"参考图命中缓存: {cleaned_url}")
+                        return mime_guess, data
                 except Exception as e:
-                    logger.warning(f"下载参考图失败: {e}")
+                    logger.debug(f"检查参考图缓存失败: {e}")
+
+                # 优化请求头，兼容 CQ 码图服务器
+                headers: dict[str, str] = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                    ),
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Accept-Encoding": "gzip, deflate, br",
+                }
+                if parsed_url.scheme and parsed_url.netloc:
+                    headers["Referer"] = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                if "gchat.qpic.cn" in (parsed_url.netloc or ""):
+                    headers["Referer"] = "https://qun.qq.com"
+                    headers["Origin"] = "https://qun.qq.com"
+                    headers.setdefault("Accept", headers["Accept"] + ",image/png")
+
+                timeout = aiohttp.ClientTimeout(total=12, connect=5)
+                max_retries = 3
+                retry_interval = 1.0
+
+                async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                    fallback_reason = None
+
+                    for attempt in range(1, max_retries + 1):
+                        try:
+                            async with session.get(cleaned_url, headers=headers) as resp:
+                                if resp.status == 200:
+                                    content_type = resp.headers.get("Content-Type", "image/png")
+                                    mime_type = content_type.split(";")[0] if content_type else "image/png"
+                                    image_format = (
+                                        mime_type.split("/")[1] if "/" in mime_type else "png"
+                                    )
+
+                                    cache_path = IMAGE_CACHE_DIR / f"{cache_key}.{image_format}"
+                                    saved_path = await save_image_stream(
+                                        resp.content, image_format, cache_path
+                                    )
+                                    if saved_path:
+                                        data = encode_file_to_base64(Path(saved_path))
+                                        return mime_type, data
+
+                                    logger.warning(
+                                        "下载参考图为空: attempt=%s/%s url=%s",
+                                        attempt,
+                                        max_retries,
+                                        cleaned_url,
+                                    )
+                                else:
+                                    try:
+                                        err_text = (await resp.text())[:200]
+                                    except Exception:
+                                        err_text = ""
+                                    extra_hint = ""
+                                    if resp.status == 400 and "gchat.qpic.cn" in (parsed_url.netloc or ""):
+                                        extra_hint = "（QQ 图片可能需要有效 Referer，请尝试重新发送图片或稍后再试）"
+                                    logger.warning(
+                                        "下载图片失败: HTTP %s %s attempt=%s/%s url=%s 响应摘要=%s %s",
+                                        resp.status,
+                                        resp.reason or "",
+                                        attempt,
+                                        max_retries,
+                                        cleaned_url,
+                                        err_text,
+                                        extra_hint,
+                                    )
+                                    if resp.status == 400:
+                                        fallback_reason = "http400"
+                                        break
+                        except (
+                            aiohttp.ClientConnectionError,
+                            aiohttp.ClientPayloadError,
+                            aiohttp.ServerTimeoutError,
+                            asyncio.TimeoutError,
+                        ) as e:
+                            logger.warning(
+                                "下载图片连接异常: %s attempt=%s/%s url=%s",
+                                e,
+                                attempt,
+                                max_retries,
+                                cleaned_url,
+                            )
+                            if attempt == max_retries:
+                                fallback_reason = "aiohttp_error"
+                        except Exception as e:
+                            logger.warning(
+                                "下载参考图失败: %s attempt=%s/%s url=%s",
+                                e,
+                                attempt,
+                                max_retries,
+                                cleaned_url,
+                            )
+                            if attempt == max_retries:
+                                fallback_reason = "aiohttp_error"
+
+                        if attempt < max_retries:
+                            await asyncio.sleep(retry_interval * attempt)
+
+                    if not fallback_reason:
+                        fallback_reason = "aiohttp_error"
+
+                if fallback_reason:
+                    logger.debug("aiohttp 下载失败，使用 urllib 后备方案: reason=%s url=%s", fallback_reason, cleaned_url)
+                    fallback_headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    }
+
+                    async def _download_with_urllib():
+                        def _blocking_download():
+                            try:
+                                req = urllib.request.Request(cleaned_url, headers=fallback_headers)
+                                with urllib.request.urlopen(req, timeout=12) as resp:
+                                    status = getattr(resp, "status", None) or resp.getcode()
+                                    if status != 200:
+                                        logger.warning(
+                                            "urllib 后备下载失败: HTTP %s url=%s",
+                                            status,
+                                            cleaned_url,
+                                        )
+                                        return None
+
+                                    content_type = resp.headers.get("Content-Type", "image/png")
+                                    mime_type = (
+                                        content_type.split(";")[0] if content_type else "image/png"
+                                    )
+                                    image_format = (
+                                        mime_type.split("/")[1] if "/" in mime_type else "png"
+                                    )
+
+                                    cache_path = IMAGE_CACHE_DIR / f"{cache_key}.{image_format}"
+                                    try:
+                                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                                        data_bytes = resp.read()
+                                        if not data_bytes:
+                                            logger.warning("urllib 后备下载返回空数据: url=%s", cleaned_url)
+                                            return None
+
+                                        with open(cache_path, "wb") as f:
+                                            f.write(data_bytes)
+
+                                        encoded = base64.b64encode(data_bytes).decode("utf-8")
+                                        return mime_type, encoded
+                                    except Exception as e:
+                                        logger.warning(
+                                            "urllib 后备下载写入缓存失败: %s url=%s", e, cleaned_url
+                                        )
+                                        return None
+                            except Exception as e:
+                                logger.warning("urllib 后备下载异常: %s url=%s", e, cleaned_url)
+                                return None
+
+                        return await asyncio.to_thread(_blocking_download)
+
+                    mime_and_data = await _download_with_urllib()
+                    if mime_and_data:
+                        return mime_and_data
 
             # 尝试解析为裸/宽松 base64 数据（在文件路径之前，避免长字符串导致 "File name too long"）
             if len(image_str) > 255 or not any(
@@ -377,9 +689,7 @@ class GeminiAPIClient:
                         if image_path.exists() and image_path.is_file():
                             suffix = image_path.suffix.lower().lstrip(".") or "png"
                             mime_type = f"image/{suffix}"
-                            with open(image_path, "rb") as f:
-                                data_bytes = f.read()
-                            data = base64.b64encode(data_bytes).decode("utf-8")
+                            data = encode_file_to_base64(image_path)
                             return mime_type, data
                     except OSError:
                         continue
@@ -395,7 +705,7 @@ class GeminiAPIClient:
         """
         根据配置获取 API URL、请求头和负载
 
-        支持自定义 API Base URL（反代）
+        智能处理API路径前缀，无需手动输入/v1或/v1beta
         """
         # 确定 API 基础地址（支持反代）
         if config.api_base:
@@ -405,21 +715,45 @@ class GeminiAPIClient:
             if config.api_type == "google":
                 api_base = self.GOOGLE_API_BASE
             else:  # openai 兼容格式
-                api_base = self.OPENROUTER_API_BASE
+                api_base = self.OPENAI_API_BASE
 
             logger.debug(f"使用默认 API Base ({config.api_type}): {api_base}")
 
-        # 准备请求
+        # 智能构建完整URL，自动添加正确的路径前缀（如果需要的话）
         if config.api_type == "google":
-            url = f"{api_base}/models/{config.model}:generateContent"
+            # Google API 需要版本前缀
+            if not config.api_base or api_base == self.GOOGLE_API_BASE:
+                # 使用默认官方地址，直接使用完整路径
+                url = f"{api_base}/models/{config.model}:generateContent"
+            elif not any(api_base.endswith(suffix) for suffix in ["/v1beta", "/v1"]):
+                # 自定义地址但没有版本前缀，自动添加
+                url = f"{api_base}/v1beta/models/{config.model}:generateContent"
+                logger.debug("为Google API自动添加v1beta前缀")
+            else:
+                # 已经包含版本前缀，直接使用
+                url = f"{api_base}/models/{config.model}:generateContent"
+                logger.debug("使用已包含版本前缀的Google API地址")
+
             payload = await self._prepare_google_payload(config)
             headers = {
                 "x-goog-api-key": config.api_key,
                 "Content-Type": "application/json",
             }
         else:
-            url = f"{api_base}/chat/completions"
-            payload = await self._prepare_openrouter_payload(config)
+            # OpenAI 兼容格式
+            if not config.api_base or api_base == self.OPENAI_API_BASE:
+                # 使用默认地址，需要完整路径
+                url = f"{api_base}/chat/completions"
+            elif not any(api_base.endswith(suffix) for suffix in ["/v1", "/v1beta"]):
+                # 自定义地址但没有版本前缀，自动添加
+                url = f"{api_base}/v1/chat/completions"
+                logger.debug("为OpenAI兼容API自动添加v1前缀")
+            else:
+                # 已经包含版本前缀，直接使用
+                url = f"{api_base}/chat/completions"
+                logger.debug("使用已包含版本前缀的OpenAI兼容API地址")
+
+            payload = await self._prepare_openai_payload(config)
             headers = {
                 "Authorization": f"Bearer {config.api_key}",
                 "Content-Type": "application/json",
@@ -427,8 +761,7 @@ class GeminiAPIClient:
                 "X-Title": "AstrBot Gemini Image Advanced",
             }
 
-        logger.debug(f"准备请求到: {url}")
-
+        logger.debug(f"智能构建API URL: {url}")
         return url, headers, payload
 
     async def generate_image(
@@ -438,7 +771,7 @@ class GeminiAPIClient:
         total_timeout: int = 120,
         per_retry_timeout: int = None,
         max_total_time: int = None,
-    ) -> tuple[str | None, str | None, str | None, str | None]:
+    ) -> tuple[list[str], list[str], str | None, str | None]:
         """
         生成图像
 
@@ -448,7 +781,7 @@ class GeminiAPIClient:
             total_timeout: 总超时时间（秒）
 
         Returns:
-            (image_url, image_path, text_content, thought_signature) 或 (None, None, None, None) 如果失败
+            (image_urls, image_paths, text_content, thought_signature)，如果失败则返回空列表和None
         """
         if not self.api_keys:
             raise ValueError("未配置 API 密钥")
@@ -470,6 +803,9 @@ class GeminiAPIClient:
         if config.api_base:
             logger.debug(f"使用自定义 API Base: {config.api_base}")
 
+        # 同步详细日志开关，便于在内部网络请求中控制输出粒度
+        self.verbose_logging = bool(getattr(config, "verbose_logging", False))
+
         return await self._make_request(
             url=url,
             payload=payload,
@@ -489,7 +825,7 @@ class GeminiAPIClient:
         model: str,
         max_retries: int,
         total_timeout: int = 120,
-    ) -> tuple[str | None, str | None, str | None, str | None]:
+    ) -> tuple[list[str], list[str], str | None, str | None]:
         """执行 API 请求并处理响应，每个重试有独立的超时控制"""
 
         current_retry = 0
@@ -541,7 +877,7 @@ class GeminiAPIClient:
         if last_error:
             raise last_error
 
-        return None, None, None, None
+        return [], [], None, None
 
     def _classify_error(self, exception: Exception, error_msg: str) -> str:
         """分类错误类型"""
@@ -586,7 +922,7 @@ class GeminiAPIClient:
         headers: dict[str, str],
         api_type: str,
         model: str,
-    ) -> tuple[str | None, str | None, str | None, str | None]:
+    ) -> tuple[list[str], list[str], str | None, str | None]:
         """执行实际的HTTP请求"""
         logger.debug(f"发送请求到: {url[:100]}...")
 
@@ -611,7 +947,7 @@ class GeminiAPIClient:
                 if api_type == "google":
                     return await self._parse_gresponse(response_data, session)
                 else:  # openai 兼容格式
-                    return await self._parse_openrouter_response(response_data, session)
+                    return await self._parse_openai_response(response_data, session)
             elif response.status in [429, 402, 403]:
                 error_msg = response_data.get("error", {}).get(
                     "message", f"HTTP {response.status}"
@@ -627,7 +963,7 @@ class GeminiAPIClient:
 
     async def _parse_gresponse(
         self, response_data: dict, session: aiohttp.ClientSession
-    ) -> tuple[str | None, str | None, str | None, str | None]:
+    ) -> tuple[list[str], list[str], str | None, str | None]:
         """解析 Google 官方 API 响应"""
         import asyncio
 
@@ -640,110 +976,102 @@ class GeminiAPIClient:
                 logger.warning(f"请求被阻止: {feedback}")
             else:
                 logger.error(f"响应中没有 candidates: {response_data}")
-            return None, None, None, None
+            return [], [], None, None
 
-        candidate = response_data["candidates"][0]
-        logger.debug(f"📝 找到 {len(response_data['candidates'])} 个候选结果")
+        candidates = response_data["candidates"]
+        logger.debug(f"📝 找到 {len(candidates)} 个候选结果")
 
-        if "finishReason" in candidate and candidate["finishReason"] in [
-            "SAFETY",
-            "RECITATION",
-        ]:
-            logger.warning(f"生成被阻止: {candidate['finishReason']}")
-            return None, None, None, None
-
-        if "content" not in candidate or "parts" not in candidate["content"]:
-            logger.error("响应格式不正确")
-            return None, None, None, None
-
-        parts = candidate["content"]["parts"]
-        logger.debug(f"📋 响应包含 {len(parts)} 个部分")
-
-        # 查找图像、文本和思维签名
-        image_url = None
-        image_path = None
-        text_content = None
+        image_urls: list[str] = []
+        image_paths: list[str] = []
+        text_chunks: list[str] = []
         thought_signature = None
 
-        logger.debug(f"🖼️ 搜索图像数据... (共 {len(parts)} 个part)")
-        for i, part in enumerate(parts):
-            try:
-                logger.debug(f"检查第 {i} 个part: {list(part.keys())}")
+        for idx, candidate in enumerate(candidates):
+            finish_reason = candidate.get("finishReason")
+            if finish_reason in ["SAFETY", "RECITATION"]:
+                logger.warning(f"候选 {idx} 生成被阻止: {finish_reason}")
+                continue
 
-                # 提取思维签名
-                if "thoughtSignature" in part:
-                    thought_signature = part["thoughtSignature"]
-                    logger.debug(f"🧠 找到思维签名: {thought_signature[:50]}...")
+            content = candidate.get("content", {})
+            parts = content.get("parts") or []
+            logger.debug(f"📋 候选 {idx} 包含 {len(parts)} 个部分")
 
-                # 兼容 camelCase 与 snake_case 的图像返回字段
-                inline_data = part.get("inlineData") or part.get("inline_data")
-                if inline_data and not part.get("thought", False):
-                    mime_type = (
-                        inline_data.get("mimeType")
-                        or inline_data.get("mime_type")
-                        or "image/png"
-                    )
-                    base64_data = inline_data.get("data", "")
+            for i, part in enumerate(parts):
+                try:
+                    logger.debug(f"检查候选 {idx} 的第 {i} 个part: {list(part.keys())}")
 
-                    logger.debug(
-                        f"🎯 找到图像数据 (第{i + 1}部分): {mime_type}, 大小: {len(base64_data)} 字符"
-                    )
+                    if "thoughtSignature" in part and not thought_signature:
+                        thought_signature = part["thoughtSignature"]
+                        logger.debug(f"🧠 找到思维签名: {thought_signature[:50]}...")
 
-                    if base64_data:
-                        image_format = (
-                            mime_type.split("/")[1] if "/" in mime_type else "png"
+                    inline_data = part.get("inlineData") or part.get("inline_data")
+                    if inline_data and not part.get("thought", False):
+                        mime_type = (
+                            inline_data.get("mimeType")
+                            or inline_data.get("mime_type")
+                            or "image/png"
                         )
+                        base64_data = inline_data.get("data", "")
 
-                        logger.debug("💾 开始保存图像文件...")
-                        save_start = asyncio.get_event_loop().time()
-
-                        image_path = await save_base64_image(base64_data, image_format)
-
-                        save_end = asyncio.get_event_loop().time()
                         logger.debug(
-                            f"✅ 图像保存完成，耗时: {save_end - save_start:.2f}秒"
+                            f"🎯 找到图像数据 (候选{idx} 第{i + 1}部分): {mime_type}, 大小: {len(base64_data)} 字符"
                         )
 
-                        if image_path:
-                            # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
-                            image_url = image_path
-                    else:
-                        logger.warning(f"第 {i} 个part有inlineData但data为空")
-                elif "thought" in part and part.get("thought", False):
-                    logger.debug(f"第 {i} 个part是思考内容")
-                else:
-                    logger.debug(
-                        f"第 {i} 个part不是图像也不是思考: {list(part.keys())}"
-                    )
-            except Exception as e:
-                logger.error(f"处理第 {i} 个part时出错: {e}", exc_info=True)
+                        if base64_data:
+                            image_format = (
+                                mime_type.split("/")[1] if "/" in mime_type else "png"
+                            )
 
-        # 查找文本内容
-        logger.debug("📝 搜索文本内容...")
-        text_parts = [p for p in parts if "text" in p and not p.get("thought", False)]
-        if text_parts:
-            text_content = " ".join([p["text"] for p in text_parts])
+                            logger.debug("💾 开始保存图像文件...")
+                            save_start = asyncio.get_event_loop().time()
+
+                            saved_path = await save_base64_image(
+                                base64_data, image_format
+                            )
+
+                            save_end = asyncio.get_event_loop().time()
+                            logger.debug(
+                                f"✅ 图像保存完成，耗时: {save_end - save_start:.2f}秒"
+                            )
+
+                            if saved_path:
+                                image_paths.append(saved_path)
+                                image_urls.append(saved_path)
+                        else:
+                            logger.warning(f"候选 {idx} 的第 {i} 个part有inlineData但data为空")
+                    elif "thought" in part and part.get("thought", False):
+                        logger.debug(f"候选 {idx} 的第 {i} 个part是思考内容")
+                    elif "text" in part and not part.get("thought", False):
+                        text_chunks.append(part.get("text", ""))
+                    else:
+                        logger.debug(
+                            f"候选 {idx} 的第 {i} 个part不是图像也不是思考: {list(part.keys())}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"处理候选 {idx} 的第 {i} 个part时出错: {e}", exc_info=True
+                    )
+
+        logger.debug(f"🖼️ 共找到 {len(image_paths)} 张图片")
+
+        text_content = (
+            " ".join(chunk for chunk in text_chunks if chunk).strip()
+            if text_chunks
+            else None
+        )
+        if text_content:
             logger.debug(f"🎯 找到文本内容: {text_content[:100]}...")
 
-        # 如果找到了图像或文本，返回结果
-        if image_url or text_content:
+        if image_paths:
             parse_end = asyncio.get_event_loop().time()
             logger.debug(f"🎉 API响应解析完成，总耗时: {parse_end - parse_start:.2f}秒")
-            return image_url, image_path, text_content, thought_signature
+            return image_urls, image_paths, text_content, thought_signature
 
-        # 检查是否只有文本响应（没有图像）
-        if text_parts and len(text_parts) == len(
-            [p for p in parts if not p.get("thought", False)]
-        ):
-            # 所有非思考part都是文本，没有图像
-            text_content = " ".join([p["text"] for p in text_parts])
+        if text_content:
             logger.warning("API只返回了文本响应，未生成图像，将触发重试")
-            logger.warning(f"文本内容: {text_content[:200]}...")
-
-            # 抛出可重试的错误
             raise APIError(
                 "图像生成失败：API只返回了文本响应，正在重试...",
-                500,  # 使用500状态码触发重试逻辑
+                500,
                 "no_image_retry",
             )
 
@@ -752,13 +1080,13 @@ class GeminiAPIClient:
             "图像生成失败：响应格式异常，未找到有效的图像数据", None, "invalid_response"
         )
 
-    async def _parse_openrouter_response(
+    async def _parse_openai_response(
         self, response_data: dict, session: aiohttp.ClientSession
-    ) -> tuple[str | None, str | None, str | None, str | None]:
-        """解析 OpenRouter API 响应"""
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        """解析 OpenAI API 响应"""
 
-        image_url = None
-        image_path = None
+        image_urls: list[str] = []
+        image_paths: list[str] = []
         text_content = None
         thought_signature = None
 
@@ -769,6 +1097,7 @@ class GeminiAPIClient:
 
             text_chunks: list[str] = []
             image_candidates: list[str] = []
+            extracted_urls: list[str] = []
 
             if isinstance(content, list):
                 for part in content:
@@ -777,7 +1106,9 @@ class GeminiAPIClient:
 
                     part_type = part.get("type")
                     if part_type == "text" and "text" in part:
-                        text_chunks.append(str(part.get("text", "")))
+                        text_val = str(part.get("text", ""))
+                        text_chunks.append(text_val)
+                        extracted_urls.extend(self._find_image_urls_in_text(text_val))
                     elif part_type == "image_url":
                         image_obj = part.get("image_url") or {}
                         if isinstance(image_obj, dict):
@@ -786,6 +1117,7 @@ class GeminiAPIClient:
                                 image_candidates.append(url_val)
             elif isinstance(content, str):
                 text_chunks.append(content)
+                extracted_urls.extend(self._find_image_urls_in_text(content))
 
             # 标准 images 字段（兼容 Gemini/OpenAI 混合格式）
             if "images" in message and message["images"]:
@@ -805,6 +1137,10 @@ class GeminiAPIClient:
                     elif isinstance(image_item.get("url"), str):
                         image_candidates.append(image_item["url"])
 
+            # 合并在文本里解析到的图像 URL
+            if extracted_urls:
+                image_candidates.extend(extracted_urls)
+
             # 组装文本内容
             if text_chunks:
                 text_content = " ".join([t for t in text_chunks if t]).strip() or None
@@ -820,7 +1156,11 @@ class GeminiAPIClient:
                     if candidate_url.startswith("http://") or candidate_url.startswith(
                         "https://"
                     ):
-                        return candidate_url, None, text_content, thought_signature
+                        image_urls.append(candidate_url)
+                        logger.debug(
+                            f"🖼️ OpenAI 返回可直接访问的图像链接: {candidate_url}"
+                        )
+                        continue
                     image_url, image_path = await self._download_image(
                         candidate_url, session
                     )
@@ -829,7 +1169,10 @@ class GeminiAPIClient:
                     continue
 
                 if image_url or image_path:
-                    return image_url, image_path, text_content, thought_signature
+                    if image_url:
+                        image_urls.append(image_url)
+                    if image_path:
+                        image_paths.append(image_path)
 
             # content 中查找内联 data URI（文本里）
             if isinstance(content, str):
@@ -844,7 +1187,10 @@ class GeminiAPIClient:
                 extracted_url, extracted_path = (None, None)
 
             if extracted_url or extracted_path:
-                return extracted_url, extracted_path, text_content, thought_signature
+                if extracted_url:
+                    image_urls.append(extracted_url)
+                if extracted_path:
+                    image_paths.append(extracted_path)
 
         # OpenAI 格式
         elif "data" in response_data and response_data["data"]:
@@ -853,25 +1199,34 @@ class GeminiAPIClient:
                     image_url, image_path = await self._download_image(
                         image_item["url"], session
                     )
-                    return image_url, image_path, text_content, thought_signature
+                    if image_url:
+                        image_urls.append(image_url)
+                    if image_path:
+                        image_paths.append(image_path)
+                    break
                 elif "b64_json" in image_item:
                     image_path = await save_base64_image(image_item["b64_json"], "png")
                     if image_path:
                         # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
-                        image_url = image_path
-                        return image_url, image_path, text_content, thought_signature
+                        image_urls.append(image_path)
+                        image_paths.append(image_path)
+                        break
+
+        if image_urls or image_paths:
+            logger.debug(f"🖼️ OpenAI 收集到 {len(image_paths) or len(image_urls)} 张图片")
+            return image_urls, image_paths, text_content, thought_signature
 
         # 如果只有文本内容，也返回
         if text_content:
             # 如果配置了需要文本响应，且确实没有找到图片，这里应该报错触发重试而不是直接返回文本
             # 除非这是一个纯文本请求（但在生图插件里通常不是）
-            logger.warning("OpenRouter只返回了文本响应，未生成图像，将触发重试")
+            logger.warning("OpenAI只返回了文本响应，未生成图像，将触发重试")
             raise APIError(
                 "图像生成失败：API只返回了文本响应，正在重试...", 500, "no_image_retry"
             )
 
-        logger.warning("OpenRouter 响应格式不支持或未找到图像数据")
-        return None, None, None, None
+        logger.warning("OpenAI 响应格式不支持或未找到图像数据")
+        return image_urls, image_paths, text_content, thought_signature
 
     async def _parse_data_uri(self, data_uri: str) -> tuple[str | None, str | None]:
         """解析 data URI 格式的图像"""
@@ -911,37 +1266,187 @@ class GeminiAPIClient:
 
         return None, None
 
+    def _find_image_urls_in_text(self, text: str) -> list[str]:
+        """从文本/Markdown中提取可用的 http(s) 图片链接"""
+        if not text:
+            return []
+
+        # Markdown 图片语法与裸露的图片链接
+        markdown_pattern = r"!\[[^\]]*\]\((https?://[^)]+)\)"
+        raw_pattern = r"(https?://[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|tiff|avif))(?:\b|$)"
+
+        urls: set[str] = set()
+        for pattern in (markdown_pattern, raw_pattern):
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                cleaned = match.strip().replace("&amp;", "&")
+                urls.add(cleaned)
+
+        return list(urls)
+
     async def _download_image(
         self, image_url: str, session: aiohttp.ClientSession
     ) -> tuple[str | None, str | None]:
         """下载并保存图像"""
-        try:
-            logger.debug(f"正在下载图像: {image_url[:100]}...")
+        cleaned_url = image_url.replace("&amp;", "&") if isinstance(image_url, str) else image_url
+        parsed = urllib.parse.urlparse(cleaned_url)
+        is_http = parsed.scheme in {"http", "https"}
+        cache_key = hashlib.sha256(cleaned_url.encode("utf-8")).hexdigest() if isinstance(cleaned_url, str) else None
 
-            async with session.get(
-                image_url,
-                timeout=aiohttp.ClientTimeout(total=30),
-                proxy=self.proxy,
-            ) as response:
-                if response.status != 200:
-                    logger.error(f"下载图像失败: HTTP {response.status}")
-                    return None, None
+        # 针对 CQ 码图服务器增加专用请求头
+        headers: dict[str, str] = {}
+        if is_http:
+            headers.update(
+                {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                    ),
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Connection": "keep-alive",
+                }
+            )
+            if "gchat.qpic.cn" in (parsed.netloc or ""):
+                headers["Referer"] = "https://qun.qq.com"
+            elif parsed.scheme and parsed.netloc:
+                headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
 
-                image_data = await response.read()
-                content_type = response.headers.get("Content-Type", "")
+        # 缓存命中直接返回，减少重复下载与内存占用
+        if cache_key:
+            try:
+                IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cached = next(IMAGE_CACHE_DIR.glob(f"{cache_key}.*"), None)
+                if cached and cached.exists() and cached.stat().st_size > 0:
+                    logger.debug(f"图像下载命中缓存: {cleaned_url}")
+                    return str(cached), str(cached)
+            except Exception as e:
+                logger.debug(f"检查图像缓存失败: {e}")
 
-                if "/" in content_type:
-                    image_format = content_type.split("/")[1]
-                else:
-                    image_format = "png"
+        max_retries = 3
+        retry_interval = 1.0
 
-                image_path = await save_image_data(image_data, image_format)
-                if image_path:
-                    # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
-                    image_url_local = image_path
-                    return image_url_local, image_path
-        except Exception as e:
-            logger.error(f"下载图像失败: {e}")
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.debug(
+                    f"正在下载图像: {cleaned_url[:100]}... 尝试 {attempt}/{max_retries}"
+                )
+
+                async with session.get(
+                    cleaned_url,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    proxy=self.proxy,
+                    headers=headers or None,
+                ) as response:
+                    if response.status != 200:
+                        try:
+                            err_text = await response.text()
+                        except Exception:
+                            err_text = ""
+
+                        response_reason = response.reason or ""
+                        response_content_type = response.headers.get(
+                            "Content-Type", ""
+                        )
+                        query_params = urllib.parse.parse_qs(parsed.query)
+                        param_issues: list[str] = []
+
+                        # 仅在出现 400 错误时进行参数合法性检查
+                        if response.status == 400:
+                            appid = (query_params.get("appid") or [None])[0]
+                            if appid and not re.fullmatch(r"[A-Za-z0-9]+", appid):
+                                param_issues.append("appid 格式异常（仅允许字母数字）")
+
+                            fileid = (query_params.get("fileid") or [None])[0]
+                            if fileid and not re.fullmatch(r"[A-Za-z0-9._-]+", fileid):
+                                param_issues.append(
+                                    "fileid 格式异常（仅允许字母数字、.、_、-）"
+                                )
+
+                            rkey = (query_params.get("rkey") or [None])[0]
+                            if rkey and re.search(r"[^A-Za-z0-9._-]", rkey):
+                                param_issues.append("rkey 包含特殊字符")
+
+                            spec = (query_params.get("spec") or [None])[0]
+                            if spec and not str(spec).isdigit():
+                                param_issues.append("spec 参数应为数字")
+
+                        # 根据响应内容与校验结果给出建议
+                        suggestions: list[str] = []
+                        if " " in cleaned_url or "%20" in cleaned_url:
+                            suggestions.append("URL格式错误 → 检查URL编码")
+                        if param_issues:
+                            suggestions.append("参数错误 → 检查参数格式")
+                        err_lower = err_text.lower() if err_text else ""
+                        if any(keyword in err_lower for keyword in ["auth", "key"]):
+                            suggestions.append("认证错误 → 检查API密钥")
+                        if any(keyword in err_lower for keyword in ["limit", "频率", "限制"]):
+                            suggestions.append("服务器限制 → 建议稍后重试")
+                        if not suggestions:
+                            suggestions.append("服务器限制 → 建议稍后重试")
+
+                        logger.error(
+                            "下载图像失败: HTTP %s %s url=%s 响应摘要=%s 建议=%s",
+                            response.status,
+                            response_reason,
+                            cleaned_url,
+                            err_text[:200],
+                            "；".join(dict.fromkeys(suggestions)),
+                        )
+
+                        if self.verbose_logging:
+                            logger.debug(
+                                "HTTP 400 参数检查结果: %s",
+                                "; ".join(param_issues) if param_issues else "未发现明显异常",
+                            )
+                            logger.debug("完整请求头: %s", headers or {})
+                            logger.debug("User-Agent: %s", (headers or {}).get("User-Agent", ""))
+                            logger.debug(
+                                "Content-Type: %s, Accept: %s",
+                                (headers or {}).get("Content-Type", "未设置"),
+                                (headers or {}).get("Accept", "未设置"),
+                            )
+                            logger.debug(
+                                "服务器响应详情: status=%s, reason=%s, phrase=%s, content-type=%s",
+                                response.status,
+                                response_reason,
+                                getattr(response, "reason", ""),
+                                response_content_type,
+                            )
+                            logger.debug(
+                                "服务器响应体预览: %s",
+                                err_text[:1000] if err_text else "<empty>",
+                            )
+
+                        if response.status == 400 and attempt < max_retries:
+                            await asyncio.sleep(retry_interval * attempt)
+                            continue
+                        return None, None
+
+                    content_type = response.headers.get("Content-Type", "")
+
+                    if "/" in content_type:
+                        image_format = content_type.split("/")[1].split(";")[0] or "png"
+                    else:
+                        image_format = "png"
+
+                    target_path = None
+                    if cache_key:
+                        target_path = IMAGE_CACHE_DIR / f"{cache_key}.{image_format}"
+
+                    image_path = await save_image_stream(
+                        response.content, image_format, target_path=target_path
+                    )
+                    if image_path:
+                        # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
+                        image_url_local = image_path
+                        return image_url_local, image_path
+            except aiohttp.ClientError as e:
+                logger.error(f"下载图像发生网络异常: {e}")
+            except Exception as e:
+                logger.error(f"下载图像失败: {e}")
+
+            if attempt < max_retries:
+                await asyncio.sleep(retry_interval * attempt)
 
         return None, None
 

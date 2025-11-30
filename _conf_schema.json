@@ -1,5 +1,5 @@
 {
-  "openrouter_api_keys": {
+  "openai_api_keys": {
     "description": "API密钥列表（记得删除默认文本）",
     "type": "list",
     "hint": "支持 OpenAI 兼容格式的 API 密钥。支持多个密钥自动轮换，当一个密钥额度耗尽时会自动切换到下一个。也可以填入 Google AI Studio 的 API Key（如果使用官方 API）",
@@ -24,9 +24,9 @@
         ]
       },
       "custom_api_base": {
-        "description": "自定义 API Base URL（可选不填需要在海外）",
+        "description": "自定义 API Base URL（可选，用于海外或反代理）",
         "type": "string",
-        "hint": "自定义的 API 基础地址,需要按照默认格式添加路径。OpenAI 兼容格式默认: https://openrouter.ai/api/v1，Google 官方默认: https://generativelanguage.googleapis.com/v1beta",
+        "hint": "自定义的 API 基础地址，无需包含版本路径。系统会根据API类型自动添加正确的路径前缀（/v1 或 /v1beta）。\n示例：\n• Google API: https://generativelanguage.googleapis.com\n• OpenAI兼容: https://api.openai.com\n• 自定义反代: https://your-proxy.com",
         "default": ""
       },
       "model": {

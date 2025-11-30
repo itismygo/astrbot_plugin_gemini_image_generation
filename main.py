@@ -9,15 +9,17 @@ import asyncio
 import base64
 import os
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 import yaml
+
 from astrbot.api import logger
-from astrbot.api.all import Image, Reply
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Image, Reply
 from astrbot.api.star import Context, Star, register
 
 from .tl import create_zip, split_image
@@ -181,7 +183,9 @@ class GeminiImageGenerationPlugin(Star):
                 for user_id in mentioned_users:
                     logger.info(f"[AVATAR] 获取@用户头像: {user_id}")
                     download_tasks.append(
-                        download_qq_avatar(str(user_id), f"mentioned_{user_id}")
+                        download_qq_avatar(
+                            str(user_id), f"mentioned_{user_id}", event=event
+                        )
                     )
             else:
                 # 无@用户：获取发送者头像
@@ -193,7 +197,9 @@ class GeminiImageGenerationPlugin(Star):
                     sender_id = str(event.message_obj.sender.user_id)
                     logger.info(f"[AVATAR] 获取发送者头像: {sender_id}")
                     download_tasks.append(
-                        download_qq_avatar(sender_id, f"sender_{sender_id}")
+                        download_qq_avatar(
+                            sender_id, f"sender_{sender_id}", event=event
+                        )
                     )
 
             # 执行下载任务
@@ -267,7 +273,7 @@ class GeminiImageGenerationPlugin(Star):
 
     def _load_config(self):
         """从配置加载所有设置"""
-        self.api_keys = self.config.get("openrouter_api_keys", [])
+        self.api_keys = self.config.get("openai_api_keys", [])
         if not isinstance(self.api_keys, list):
             self.api_keys = [self.api_keys] if self.api_keys else []
 
@@ -476,99 +482,253 @@ class GeminiImageGenerationPlugin(Star):
         else:
             logger.error("✗ API 客户端初始化失败，请检查配置")
 
-    async def _collect_reference_images(self, event: AstrMessageEvent) -> list[str]:
-        """从消息和回复中提取参考图片，并转换为base64格式"""
-        reference_images = []
+    async def _download_qq_image(self, url: str) -> str | None:
+        """对QQ图床做特殊处理，补充Referer/UA后转为base64"""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Connection": "keep-alive",
+            }
+            if parsed.netloc:
+                headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
+            if "qpic.cn" in (parsed.netloc or ""):
+                headers["Referer"] = "https://qun.qq.com"
+
+            timeout = aiohttp.ClientTimeout(total=12, connect=5)
+            async with aiohttp.ClientSession(headers=headers, trust_env=True) as session:
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"QQ图片下载失败: HTTP {resp.status} {resp.reason} | {url[:80]}"
+                        )
+                        return None
+                    data = await resp.read()
+                    if not data:
+                        logger.warning(f"QQ图片为空: {url[:80]}")
+                        return None
+                    mime = resp.headers.get("Content-Type", "image/jpeg")
+                    if ";" in mime:
+                        mime = mime.split(";", 1)[0]
+                    base64_data = base64.b64encode(data).decode("utf-8")
+                    return f"data:{mime};base64,{base64_data}"
+        except Exception as e:
+            logger.warning(f"QQ图片下载异常: {e} | {url[:80]}")
+            return None
+
+    async def _fetch_images_from_event(
+        self, event: AstrMessageEvent, include_at_avatars: bool = False
+    ) -> tuple[list[str], list[str]]:
+        """
+        综合提取事件中的图片：当前消息、引用消息及手动@用户头像
+
+        返回 (消息/引用图片, 头像图片)
+        """
+        message_images: list[str] = []
+        avatar_images: list[str] = []
+        seen_sources: set[str] = set()
+        seen_users: set[str] = set()
+        conversion_cache: dict[str, str] = {}
         max_images = self.max_reference_images
 
         if not hasattr(event, "message_obj") or not event.message_obj:
-            return reference_images
+            return message_images, avatar_images
 
-        message_chain = event.message_obj.message
+        try:
+            message_chain = event.get_messages()
+        except Exception:
+            message_chain = getattr(event.message_obj, "message", []) or []
+
         if not message_chain:
-            return reference_images
+            return message_images, avatar_images
 
-        async def convert_to_base64(img_source: str) -> str | None:
-            """将图片源转换为base64格式"""
+        self_id = None
+        try:
+            self_id = str(event.get_self_id())
+        except Exception:
             try:
-                if img_source.startswith(("http://", "https://")):
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            img_source, timeout=aiohttp.ClientTimeout(total=10)
-                        ) as response:
-                            if response.status == 200:
-                                image_data = await response.read()
-                                return base64.b64encode(image_data).decode("utf-8")
-                            else:
-                                logger.warning(f"下载图片失败: HTTP {response.status}")
-                                return None
-                elif img_source.startswith("data:image/"):
-                    return img_source
-                elif self._is_valid_base64_image_str(img_source):
-                    return img_source
+                self_id = str(getattr(event.message_obj, "self_id", None))
+            except Exception:
+                self_id = None
+
+        def _is_auto_at(comp: At) -> bool:
+            """区分自动@，兼容多种属性命名"""
+            flags = [
+                getattr(comp, "is_auto", None),
+                getattr(comp, "auto", None),
+                getattr(comp, "auto_at", None),
+                getattr(comp, "autoAt", None),
+            ]
+            for flag in flags:
+                if isinstance(flag, str):
+                    flag_val = flag.lower() in {"true", "1", "yes", "y"}
                 else:
-                    logger.debug(f"跳过非HTTP/base64格式的图片源: {img_source[:64]}...")
-                    return None
-            except Exception as e:
-                import traceback
+                    flag_val = bool(flag)
+                if flag_val:
+                    return True
+            return False
 
-                logger.warning(
-                    f"转换图片为base64失败: {repr(e)} | Source: {str(img_source)[:100]}"
-                )
-                logger.debug(traceback.format_exc())
+        async def convert_to_base64(img_source: str, origin: str) -> str | None:
+            """将图片源转换为base64格式，内置QQ直链强化处理"""
+            if not img_source:
                 return None
+            if img_source in conversion_cache:
+                return conversion_cache[img_source]
 
+            parsed_host = ""
+            try:
+                parsed_host = urllib.parse.urlparse(str(img_source)).netloc or ""
+            except Exception:
+                parsed_host = ""
+
+            if parsed_host and "qpic.cn" in parsed_host:
+                qq_data = await self._download_qq_image(str(img_source))
+                if qq_data:
+                    conversion_cache[img_source] = qq_data
+                    return qq_data
+                logger.warning(f"QQ图片直链处理失败，尝试通用流程: {img_source[:80]}")
+
+            try:
+                if not self.api_client:
+                    logger.warning("API 客户端未初始化，无法转换图片为base64")
+                    return None
+                mime_type, base64_data = await self.api_client._normalize_image_input(
+                    img_source
+                )
+                if base64_data:
+                    data_url = (
+                        f"data:{mime_type};base64,{base64_data}"
+                        if mime_type
+                        else base64_data
+                    )
+                    conversion_cache[img_source] = data_url
+                    return data_url
+                logger.debug(f"跳过无法识别的图片源({origin}): {str(img_source)[:80]}...")
+            except Exception as e:
+                logger.warning(
+                    f"转换图片为base64失败({origin}): {repr(e)} | Source: {str(img_source)[:80]}"
+                )
+            return None
+
+        async def handle_image_component(component, origin: str):
+            if len(message_images) >= max_images:
+                return
+
+            img_source = None
+            if isinstance(component, Image):
+                if getattr(component, "url", None):
+                    img_source = component.url
+                elif getattr(component, "file", None):
+                    img_source = component.file
+            else:
+                if getattr(component, "url", None):
+                    img_source = component.url
+                elif getattr(component, "file", None):
+                    img_source = component.file
+
+            if not img_source:
+                return
+
+            if img_source in seen_sources:
+                self.log_debug(f"跳过重复图片源({origin}): {str(img_source)[:120]}")
+                return
+
+            seen_sources.add(img_source)
+            base64_img = await convert_to_base64(str(img_source), origin)
+            if base64_img:
+                message_images.append(base64_img)
+                self.log_debug(
+                    f"✓ 从{origin}提取图片 (当前: {len(message_images)}/{max_images})"
+                )
+
+        async def handle_at_component(component: At, origin: str):
+            if not include_at_avatars:
+                return
+
+            if _is_auto_at(component):
+                self.log_debug(f"跳过自动@用户（{origin}）")
+                return
+
+            user_id = getattr(component, "qq", None) or getattr(
+                component, "user_id", None
+            )
+            if not user_id:
+                return
+
+            user_id = str(user_id)
+            if self_id and user_id == self_id:
+                return
+            if user_id in seen_users:
+                return
+
+            avatar_b64 = await self.avatar_manager.get_avatar(
+                user_id, f"at_{user_id}", event=event
+            )
+            if avatar_b64:
+                avatar_images.append(avatar_b64)
+                seen_users.add(user_id)
+                self.log_debug(f"✓ 获取@用户头像({origin}): {user_id}")
+            else:
+                self.log_debug(f"✗ 获取@用户头像失败({origin}): {user_id}")
+
+        # 当前消息体处理
         for component in message_chain:
-            if isinstance(component, Image) and len(reference_images) < max_images:
-                try:
-                    img_source = None
-                    if hasattr(component, "url") and component.url:
-                        img_source = component.url
-                    elif (
-                        hasattr(component, "file")
-                        and component.file
-                        and isinstance(component.file, str)
-                    ):
-                        img_source = component.file
+            try:
+                if isinstance(component, Image):
+                    await handle_image_component(component, "当前消息")
+                elif isinstance(component, At):
+                    await handle_at_component(component, "当前消息")
+                elif isinstance(component, Reply) and component.chain:
+                    for reply_comp in component.chain:
+                        if isinstance(reply_comp, Image):
+                            await handle_image_component(reply_comp, "引用消息")
+                        elif isinstance(reply_comp, At):
+                            await handle_at_component(reply_comp, "引用消息")
+            except Exception as e:
+                logger.warning(f"处理消息组件异常: {e}")
 
-                    if img_source:
-                        base64_img = await convert_to_base64(img_source)
-                        if base64_img:
-                            reference_images.append(base64_img)
-                            logger.debug(
-                                f"✓ 从当前消息提取图片 (当前: {len(reference_images)}/{max_images})"
-                            )
-                except Exception as e:
-                    logger.warning(f"✗ 提取图片失败: {e}")
+        # 如果需要头像但没有@，尝试回退到发送者头像
+        if include_at_avatars and not avatar_images:
+            try:
+                sender_id = None
+                if hasattr(event, "message_obj") and hasattr(
+                    event.message_obj, "sender"
+                ):
+                    sender = event.message_obj.sender
+                    sender_id = getattr(sender, "user_id", None) or getattr(
+                        sender, "userId", None
+                    )
+                if sender_id and str(sender_id) not in seen_users:
+                    sender_id = str(sender_id)
+                    avatar_b64 = await self.avatar_manager.get_avatar(
+                        sender_id, f"sender_{sender_id}", event=event
+                    )
+                    if avatar_b64:
+                        avatar_images.append(avatar_b64)
+                        seen_users.add(sender_id)
+                        self.log_debug(f"✓ 回退获取发送者头像: {sender_id}")
+            except Exception as e:
+                logger.debug(f"回退获取发送者头像失败: {e}")
 
-        for component in message_chain:
-            if isinstance(component, Reply) and component.chain:
-                for reply_comp in component.chain:
-                    if (
-                        isinstance(reply_comp, Image)
-                        and len(reference_images) < max_images
-                    ):
-                        try:
-                            img_source = None
-                            if hasattr(reply_comp, "url") and reply_comp.url:
-                                img_source = reply_comp.url
-                            elif (
-                                hasattr(reply_comp, "file")
-                                and reply_comp.file
-                                and isinstance(reply_comp.file, str)
-                            ):
-                                img_source = reply_comp.file
+        # 截断数量，优先保留消息图片，再补充头像
+        if len(message_images) > max_images:
+            message_images = message_images[:max_images]
+        remaining_slots = max(max_images - len(message_images), 0)
+        if len(avatar_images) > remaining_slots:
+            avatar_images = avatar_images[:remaining_slots]
 
-                            if img_source:
-                                base64_img = await convert_to_base64(img_source)
-                                if base64_img:
-                                    reference_images.append(base64_img)
-                                    self.log_debug("✓ 从回复消息提取图片")
-                        except Exception as e:
-                            logger.warning(f"✗ 提取回复图片失败: {e}")
+        if message_images or avatar_images:
+            logger.info(
+                f"📸 已收集图片: 消息 {len(message_images)} 张，头像 {len(avatar_images)} 张"
+            )
+        else:
+            logger.info("📸 未收集到有效参考图片，若需参考图可直接发送图片或检查网络权限")
 
-        logger.info(f"📸 共收集到 {len(reference_images)} 张参考图片")
-        return reference_images
+        return message_images, avatar_images
 
     async def _generate_image_core_internal(
         self,
@@ -576,15 +736,20 @@ class GeminiImageGenerationPlugin(Star):
         prompt: str,
         reference_images: list[str],
         avatar_reference: list[str],
-    ) -> tuple[bool, tuple[str, str, str | None] | str]:
+    ) -> tuple[bool, tuple[list[str], list[str], str | None, str | None] | str]:
         """
         内部核心图像生成方法，不发送消息，只返回结果
 
         Returns:
-            tuple[bool, tuple[str, str, str | None] | str]: (是否成功, (图片路径, 文本内容, 思维签名) 或错误消息)
+            tuple[bool, tuple[list[str], list[str], str | None, str | None] | str]:
+            (是否成功, (图片URL列表, 图片路径列表, 文本内容, 思维签名) 或错误消息)
         """
         if not self.api_client:
-            return False, "❌ 错误: API 客户端未初始化，请联系管理员配置 API 密钥"
+            return False, (
+                "❌ 无法生成图像：API 客户端尚未初始化。\n"
+                "🧐 可能原因：API 配置或密钥缺失、加载失败。\n"
+                "✅ 建议：先在配置文件中填写有效的 API 密钥并重启服务。"
+            )
 
         valid_msg_images = self._filter_valid_reference_images(
             reference_images, source="消息图片"
@@ -627,6 +792,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             enable_smart_retry=self.enable_smart_retry,
             enable_text_response=self.enable_text_response,
             force_resolution=self.force_resolution,
+            verbose_logging=self.verbose_logging,
         )
 
         logger.info("🎨 图像生成请求:")
@@ -648,8 +814,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             )
 
             (
-                image_url,
-                image_path,
+                image_urls,
+                image_paths,
                 text_content,
                 thought_signature,
             ) = await self.api_client.generate_image(
@@ -662,51 +828,208 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             end_time = asyncio.get_event_loop().time()
             api_duration = end_time - start_time
             logger.info(f"✅ API调用完成，耗时: {api_duration:.2f}秒")
+            logger.info(
+                f"🖼️ API 返回图片数量: {len(image_paths)}, URL 数量: {len(image_urls)}"
+            )
 
             if thought_signature:
                 logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
 
-            if image_path and Path(image_path).exists():
-                if self.nap_server_address and self.nap_server_address != "localhost":
-                    logger.info("📤 检测到远程服务器配置，开始文件传输...")
+            resolved_paths: list[str] = []
+            for idx, img_path in enumerate(image_paths):
+                if not img_path:
+                    continue
+                if Path(img_path).exists():
+                    resolved_path = img_path
+                    if self.nap_server_address and self.nap_server_address != "localhost":
+                        logger.info(f"📤 开始传输第 {idx + 1} 张图片到远程服务器...")
+                        try:
+                            remote_path = await asyncio.wait_for(
+                                send_file(
+                                    img_path,
+                                    host=self.nap_server_address,
+                                    port=self.nap_server_port,
+                                ),
+                                timeout=10.0,
+                            )
+                            if remote_path:
+                                resolved_path = remote_path
+                        except asyncio.TimeoutError:
+                            logger.warning("⚠️ 文件传输超时，使用本地文件")
+                        except Exception as e:
+                            logger.warning(f"⚠️ 文件传输失败: {e}，将使用本地文件")
+                    resolved_paths.append(resolved_path)
+                else:
+                    logger.warning(f"⚠️ 图像文件不存在或不可访问: {img_path}")
+                    resolved_paths.append(img_path)
 
-                    try:
-                        remote_path = await asyncio.wait_for(
-                            send_file(
-                                image_path,
-                                host=self.nap_server_address,
-                                port=self.nap_server_port,
-                            ),
-                            timeout=10.0,
-                        )
-                        if remote_path:
-                            image_path = remote_path
-                    except asyncio.TimeoutError:
-                        logger.warning("⚠️ 文件传输超时，使用本地文件")
-                    except Exception as e:
-                        logger.warning(f"⚠️ 文件传输失败: {e}，将使用本地文件")
+            image_paths = resolved_paths
 
-                logger.info("📨 图像生成完成，准备返回结果...")
-                return True, (image_path, text_content, thought_signature)
-            else:
-                error_msg = f"❌ 图像文件不存在或路径无效: {image_path}"
-                logger.error(error_msg)
-                return False, error_msg
+            available_paths = [p for p in image_paths if p]
+            available_urls = [u for u in image_urls if u]
+            if available_paths or available_urls:
+                logger.info(
+                    f"📨 图像生成完成，准备返回结果，文件路径 {len(available_paths)} 张，URL {len(available_urls)} 张"
+                )
+                return True, (
+                    image_urls,
+                    image_paths,
+                    text_content,
+                    thought_signature,
+                )
+
+            error_msg = (
+                "❌ 图像文件未找到，无法返回结果。\n"
+                "🧐 可能原因：生成后保存文件失败，或远程传输路径无效。\n"
+                "✅ 建议：检查临时目录写入权限与磁盘空间，必要时重试。"
+            )
+            logger.error(error_msg)
+            return False, error_msg
 
         except APIError as e:
-            error_msg = f"❌ 图像生成失败: {e.message}"
+            status_part = f"（状态码 {e.status_code}）" if e.status_code is not None else ""
+            error_msg = f"❌ 图像生成失败{status_part}：{e.message}"
             if e.status_code == 429:
-                error_msg += "\n💡 可能原因：API 速率限制或额度耗尽"
+                error_msg += "\n🧐 可能原因：请求过于频繁或额度已用完。\n✅ 建议：稍等片刻再试，或在配置中增加可用额度/开启智能重试。"
             elif e.status_code == 402:
-                error_msg += "\n💡 可能原因：API 额度不足"
+                error_msg += "\n🧐 可能原因：账户余额不足或套餐到期。\n✅ 建议：充值或更换一组可用的 API 密钥后再试。"
             elif e.status_code == 403:
-                error_msg += "\n💡 可能原因：API 密钥无效或权限不足"
+                error_msg += "\n🧐 可能原因：API 密钥无效、权限不足或访问受限。\n✅ 建议：核对密钥权限、检查 IP 白名单，必要时重新生成密钥。"
+            elif e.status_code and 500 <= e.status_code < 600:
+                error_msg += "\n🧐 可能原因：上游服务暂时不可用。\n✅ 建议：稍后重试，若频繁出现请联系服务提供方确认故障。"
+            else:
+                error_msg += "\n🧐 可能原因：请求参数异常或服务返回未知错误。\n✅ 建议：简化提示词/减少参考图后重试，并查看日志获取更多细节。"
             logger.error(error_msg)
             return False, error_msg
 
         except Exception as e:
             logger.error(f"生成图像时发生未预期的错误: {e}", exc_info=True)
             return False, f"❌ 生成图像时发生错误: {str(e)}"
+
+    def _merge_available_images(
+        self, image_paths: list[str] | None, image_urls: list[str] | None
+    ) -> list[str]:
+        """合并路径与URL，保持顺序，过滤空值"""
+        merged: list[str] = []
+        for img in image_paths or []:
+            if img:
+                merged.append(img)
+        for url in image_urls or []:
+            if url:
+                merged.append(url)
+        return merged
+
+    def _build_forward_image_component(self, image: str):
+        """根据来源构造合并转发图片组件，优先使用本地文件"""
+        from astrbot.api.message_components import Image as AstrImage
+        from astrbot.api.message_components import Plain
+
+        try:
+            if not image:
+                raise ValueError("空的图片地址")
+
+            fs_candidate = image
+            if image.startswith("file:///"):
+                fs_candidate = image[8:]
+
+            if os.path.exists(fs_candidate):
+                return AstrImage.fromFileSystem(fs_candidate)
+            if image.startswith(("http://", "https://")):
+                return AstrImage.fromURL(image)
+
+            return AstrImage(file=image)
+        except Exception as e:
+            logger.warning(f"构造图片组件失败: {e}")
+            return Plain(f"[图片不可用: {image[:48]}]")
+
+    async def _dispatch_send_results(
+        self,
+        event: AstrMessageEvent,
+        image_urls: list[str] | None,
+        image_paths: list[str] | None,
+        text_content: str | None,
+        thought_signature: str | None = None,
+        scene: str = "默认",
+    ):
+        """
+        根据内容数量选择发送模式：
+        - 单图：按原逻辑发送
+        - 总数<=4：链式发送
+        - 总数>4：合并转发
+        """
+        cleaned_text = self._clean_text_content(text_content) if text_content else ""
+        text_to_send = cleaned_text if (self.enable_text_response and cleaned_text) else ""
+
+        available_images = self._merge_available_images(image_paths, image_urls)
+        total_items = len(available_images) + (1 if text_to_send else 0)
+
+        logger.info(
+            f"[SEND] 场景={scene}，图片={len(available_images)}，文本={'1' if text_to_send else '0'}，总计={total_items}"
+        )
+
+        if not available_images:
+            if cleaned_text:
+                yield event.plain_result("⚠️ 当前模型只返回了文本，请检查模型配置或者重试")
+                if text_to_send:
+                    yield event.plain_result(f"📝 {text_to_send}")
+            else:
+                yield event.plain_result(
+                    "❌ 未能成功生成图像。\n"
+                    "🧐 可能原因：模型返回空结果、提示词冲突或参考图处理异常。\n"
+                    "✅ 建议：简化描述、减少参考图数量后再试，或稍后重试。"
+                )
+            return
+
+        # 单图直发
+        if len(available_images) == 1:
+            logger.info("[SEND] 采用单图直发模式")
+            if text_to_send:
+                yield event.plain_result(f"📝 {text_to_send}")
+            yield event.image_result(available_images[0])
+            if thought_signature:
+                logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
+            return
+
+        # 短链顺序发送
+        if total_items <= 4:
+            logger.info("[SEND] 采用短链顺序发送模式")
+            if text_to_send:
+                yield event.plain_result(f"📝 {text_to_send}")
+            for img in available_images:
+                yield event.image_result(img)
+            if thought_signature:
+                logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
+            return
+
+        # 合并转发
+        logger.info("[SEND] 采用合并转发模式")
+        from astrbot.api.message_components import Node, Plain
+
+        node_content = []
+        if text_to_send:
+            node_content.append(Plain(f"📝 {text_to_send}"))
+
+        for idx, img in enumerate(available_images, 1):
+            node_content.append(Plain(f"图片 {idx}:"))
+            node_content.append(self._build_forward_image_component(img))
+
+        sender_id = "0"
+        sender_name = "Gemini图像生成"
+        try:
+            if hasattr(event, "message_obj") and getattr(event, "message_obj", None):
+                sender_id = getattr(event.message_obj, "self_id", "0")
+        except Exception:
+            pass
+
+        node = Node(
+            uin=sender_id,
+            name=sender_name,
+            content=node_content,
+        )
+        yield event.chain_result([node])
+
+        if thought_signature:
+            logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
 
     async def _quick_generate_image(
         self,
@@ -721,21 +1044,21 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return
 
         try:
-            ref_images = await self._collect_reference_images(event)
-            self.log_debug(f"[MODIFY_DEBUG] 收集到 {len(ref_images)} 张参考图片")
-
-            avatars = []
-            if use_avatar:
-                avatars = await self.get_avatar_reference(event)
-                self.log_debug(f"[MODIFY_DEBUG] 收集到 {len(avatars)} 个头像")
+            ref_images, avatars = await self._fetch_images_from_event(
+                event, include_at_avatars=use_avatar
+            )
+            self.log_debug(
+                f"[MODIFY_DEBUG] 收集到消息图片 {len(ref_images)} 张，头像 {len(avatars)} 个"
+            )
 
             all_ref_images: list[str] = []
             all_ref_images.extend(
                 self._filter_valid_reference_images(ref_images, source="消息图片")
             )
-            all_ref_images.extend(
-                self._filter_valid_reference_images(avatars, source="头像")
-            )
+            if use_avatar:
+                all_ref_images.extend(
+                    self._filter_valid_reference_images(avatars, source="头像")
+                )
 
             self.log_debug(f"[MODIFY_DEBUG] 有效参考图片总数: {len(all_ref_images)}")
 
@@ -782,6 +1105,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 reference_images=all_ref_images if all_ref_images else None,
                 enable_smart_retry=self.enable_smart_retry,
                 enable_text_response=self.enable_text_response,
+                verbose_logging=self.verbose_logging,
             )
 
             # 记录改图请求的详细信息
@@ -796,8 +1120,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             yield event.plain_result("🎨 生成中...")
 
             (
-                image_url,
-                image_path,
+                image_urls,
+                image_paths,
                 text_content,
                 thought_signature,
             ) = await self.api_client.generate_image(
@@ -807,30 +1131,23 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 max_total_time=self.total_timeout * 2,
             )
 
-            if image_url and image_path:
-                logger.debug(
-                    f"准备发送图像: image_path类型={type(image_path)}, 值={image_path}"
-                )
-
-                result_chain = []
-                if text_content and self.enable_text_response:
-                    cleaned_text = self._clean_text_content(text_content)
-                    if cleaned_text:
-                        result_chain.append(event.plain_result(f"📝 {cleaned_text}"))
-
-                result_chain.append(event.image_result(image_path))
-
-                for res in result_chain:
-                    yield res
-
-                if thought_signature:
-                    logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
-            else:
-                yield event.plain_result("❌ 生成失败")
+            async for send_res in self._dispatch_send_results(
+                event=event,
+                image_urls=image_urls,
+                image_paths=image_paths,
+                text_content=text_content,
+                thought_signature=thought_signature,
+                scene="快捷生成",
+            ):
+                yield send_res
 
         except Exception as e:
             logger.error(f"快捷生成失败: {e}", exc_info=True)
-            yield event.plain_result(f"❌ 错误: {str(e)}")
+            yield event.plain_result(
+                f"❌ 快速生成时出现异常：{str(e)}\n"
+                "🧐 可能原因：网络波动、配置缺失或依赖加载失败。\n"
+                "✅ 建议：稍后重试，并检查 API 配置与日志定位具体问题。"
+            )
         finally:
             try:
                 await self.avatar_manager.cleanup_used_avatars()
@@ -999,10 +1316,17 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         yield event.plain_result("🎨 使用表情包模式生成图像...")
 
-        # 检查是否包含参考图
-        reference_images = await self._collect_reference_images(event)
+        use_avatar = await self.should_use_avatar(event)
+        reference_images, avatar_reference = await self._fetch_images_from_event(
+            event, include_at_avatars=use_avatar
+        )
+
         if not reference_images:
-            yield event.plain_result("❌ 表情包模式需要参考图，请至少附带一张图片作为角色参考。")
+            yield event.plain_result(
+                "❌ 表情包模式需要参考图才能生成一致的角色。\n"
+                "🧐 可能原因：消息中未附带图片，或图片格式/大小不被支持。\n"
+                "✅ 建议：请附上一张清晰的角色参考图（如头像或原表情）后再试。"
+            )
             return
 
         # 如果没有开启切割功能，直接使用默认逻辑
@@ -1014,7 +1338,6 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             try:
                 self.resolution = "4K"
                 self.aspect_ratio = "16:9"
-                use_avatar = await self.should_use_avatar(event)
                 async for result in self._quick_generate_image(
                     event, full_prompt, use_avatar
                 ):
@@ -1033,17 +1356,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             self.resolution = "4K"
             self.aspect_ratio = "16:9"
 
-            use_avatar = await self.should_use_avatar(event)
-
             # 调用生图核心逻辑，但截获结果不直接发送
-            reference_images = await self._collect_reference_images(event)
-            avatar_reference = []
-            if use_avatar:
-                avatar_reference = await self.get_avatar_reference(event)
-
             sent_success = False
             split_files: list[str] = []
-            image_path = None
 
             success, result_data = await self._generate_image_core_internal(
                 event=event,
@@ -1053,25 +1368,46 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             )
 
             if not success or not isinstance(result_data, tuple):
-                error_msg = result_data if isinstance(result_data, str) else "❌ 图像生成失败，请稍后重试"
+                error_msg = (
+                    f"{result_data}\n🧐 可能原因：参考图不可用、网络波动或模型返回空结果。\n✅ 建议：确认图片可访问、简化提示词后再试。"
+                    if isinstance(result_data, str)
+                    else "❌ 表情包生成未成功。\n🧐 可能原因：模型未返回有效结果或参考图处理失败。\n✅ 建议：重新上传参考图或稍后再试。"
+                )
                 yield event.plain_result(error_msg)
                 return
 
-            image_path, text_content, thought_signature = result_data
+            image_urls, image_paths, text_content, thought_signature = result_data
+            primary_image_path = next(
+                (p for p in image_paths if p and Path(p).exists()), None
+            )
+            if not primary_image_path and image_urls:
+                primary_image_path = image_urls[0]
+
+            if not primary_image_path:
+                yield event.plain_result(
+                    "❌ 未获取到可用的表情源图。\n"
+                    "🧐 可能原因：模型未返回图像或图像保存失败。\n"
+                    "✅ 建议：检查日志后重试，或更换模型/提示词。"
+                )
+                return
 
             # 1. 切割图片
             yield event.plain_result("✂️ 正在切割图片...")
             try:
                 split_files = await asyncio.to_thread(
-                    split_image, image_path, rows=6, cols=4
+                    split_image, primary_image_path, rows=6, cols=4
                 )
             except Exception as e:
                 logger.error(f"切割图片时发生异常: {e}")
                 split_files = []
 
             if not split_files:
-                yield event.plain_result("❌ 图片切割失败")
-                yield event.image_result(image_path)
+                yield event.plain_result(
+                    "❌ 图片切割失败，无法生成表情包切片。\n"
+                    "🧐 可能原因：源图尺寸异常、裁剪依赖缺失或磁盘空间不足。\n"
+                    "✅ 建议：尝试降低分辨率重新生成，检查本地裁剪依赖与磁盘空间后再试。"
+                )
+                yield event.image_result(primary_image_path)
                 return
 
             # 2. 准备发送逻辑
@@ -1089,7 +1425,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         yield event.chain_result([file_comp])
                         sent_success = True
 
-                        yield event.image_result(image_path)
+                        yield event.image_result(primary_image_path)
                     except Exception as e:
                         logger.warning(f"发送ZIP失败: {e}")
                         yield event.plain_result(
@@ -1097,7 +1433,11 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         )
                         sent_success = False
                 else:
-                    yield event.plain_result("❌ 压缩包创建失败，降级使用合并转发")
+                    yield event.plain_result(
+                        "❌ 压缩包创建失败，已尝试改用合并转发。\n"
+                        "🧐 可能原因：临时目录无写权限或磁盘空间不足。\n"
+                        "✅ 建议：清理磁盘或调整临时目录权限后重试，如仍失败可关闭 ZIP 发送。"
+                    )
                     sent_success = False
 
             # 3. 如果没开启ZIP或者ZIP发送失败，发送合并转发
@@ -1108,7 +1448,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 # 构造节点内容：原图 + 所有小图
                 node_content = []
                 node_content.append(Plain("原图预览：\n"))
-                node_content.append(AstrImage.fromFileSystem(image_path))
+                node_content.append(AstrImage.fromFileSystem(primary_image_path))
                 node_content.append(Plain("\n\n表情包切片：\n"))
 
                 for file_path in split_files:
@@ -1330,12 +1670,10 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         full_prompt = get_style_change_prompt(style, prompt)
 
-        reference_images = await self._collect_reference_images(event)
-
-        # 根据配置决定是否使用头像参考
-        avatar_reference = []
-        if await self.should_use_avatar(event):
-            avatar_reference = await self.get_avatar_reference(event)
+        use_avatar = await self.should_use_avatar(event)
+        reference_images, avatar_reference = await self._fetch_images_from_event(
+            event, include_at_avatars=use_avatar
+        )
 
         yield event.plain_result("🎨 开始转换风格...")
 
@@ -1347,21 +1685,16 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         )
 
         if success and result_data:
-            image_path, text_content, thought_signature = result_data
-
-            result_chain = []
-            if text_content and self.enable_text_response:
-                cleaned_text = self._clean_text_content(text_content)
-                if cleaned_text:
-                    result_chain.append(event.plain_result(f"📝 {cleaned_text}"))
-
-            result_chain.append(event.image_result(image_path))
-
-            for res in result_chain:
-                yield res
-
-            if thought_signature:
-                logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
+            image_urls, image_paths, text_content, thought_signature = result_data
+            async for send_res in self._dispatch_send_results(
+                event=event,
+                image_urls=image_urls,
+                image_paths=image_paths,
+                text_content=text_content,
+                thought_signature=thought_signature,
+                scene="换风格",
+            ):
+                yield send_res
         else:
             yield event.plain_result(result_data)
 
@@ -1397,38 +1730,35 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         if not self.api_client:
             yield event.plain_result(
-                "❌ 错误: API 客户端未初始化，请联系管理员配置 API 密钥"
+                "❌ 无法生成图像：API 客户端尚未初始化。\n"
+                "🧐 可能原因：API 密钥未配置或加载失败。\n"
+                "✅ 建议：在插件配置中填写有效密钥并重启服务。"
             )
             return
 
-        reference_images = []
-        if str(use_reference_images).lower() in {"true", "1", "yes", "y", "是"}:
-            reference_images = await self._collect_reference_images(event)
-
-        avatar_reference = []
-
         avatar_value = str(include_user_avatar).lower()
         logger.info(f"[AVATAR_DEBUG] include_user_avatar参数: {avatar_value}")
+        include_avatar = avatar_value in {"true", "1", "yes", "y", "是"}
+        include_reference_images = str(use_reference_images).lower() in {
+            "true",
+            "1",
+            "yes",
+            "y",
+            "是",
+        }
 
-        if avatar_value in {"true", "1", "yes", "y", "是"}:
-            logger.info("[AVATAR_DEBUG] Gemini API建议获取头像，开始获取...")
-            try:
-                avatar_reference = await self.get_avatar_reference(event)
-                logger.info(
-                    f"[AVATAR_DEBUG] 头像获取完成，返回结果: {len(avatar_reference) if avatar_reference else 0} 个"
-                )
-            except Exception as e:
-                logger.error(f"头像获取失败: {e}", exc_info=True)
-                avatar_reference = []
+        reference_images, avatar_reference = await self._fetch_images_from_event(
+            event, include_at_avatars=include_avatar
+        )
 
-            if avatar_reference:
-                logger.info(f"成功获取 {len(avatar_reference)} 个头像作为参考图像")
-                for i, avatar in enumerate(avatar_reference):
-                    logger.info(f"  - 头像{i + 1}: {avatar[:50]}...")
-            else:
-                logger.info("未能获取头像，继续使用其他参考图像或纯文本生成")
-        else:
-            logger.info("[AVATAR_DEBUG] Gemini API未建议获取头像，跳过头像获取")
+        if not include_reference_images:
+            reference_images = []
+        if not include_avatar:
+            avatar_reference = []
+
+        logger.info(
+            f"[AVATAR_DEBUG] 收集到参考图: 消息 {len(reference_images)} 张，头像 {len(avatar_reference)} 张"
+        )
 
         success, result_data = await self._generate_image_core_internal(
             event=event,
@@ -1443,21 +1773,15 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             logger.warning(f"清理头像缓存失败: {e}")
 
         if success and result_data:
-            image_path, text_content, thought_signature = result_data
-
-            result_chain = []
-            if text_content and self.enable_text_response:
-                cleaned_text = self._clean_text_content(text_content)
-                if cleaned_text:
-                    result_chain.append(event.plain_result(cleaned_text))
-
-            result_chain.append(event.image_result(image_path))
-
-            for res in result_chain:
-                yield res
-
-            if thought_signature:
-                logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
+            image_urls, image_paths, text_content, thought_signature = result_data
+            async for send_res in self._dispatch_send_results(
+                event=event,
+                image_urls=image_urls,
+                image_paths=image_paths,
+                text_content=text_content,
+                thought_signature=thought_signature,
+                scene="LLM工具",
+            ):
+                yield send_res
         else:
             yield event.plain_result(result_data)
-
