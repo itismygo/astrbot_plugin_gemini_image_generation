@@ -1332,7 +1332,7 @@ class GeminiAPIClient:
             except Exception as e:
                 logger.debug(f"检查图像缓存失败: {e}")
 
-        max_retries = 3
+        max_retries = 1
         retry_interval = 1.0
 
         for attempt in range(1, max_retries + 1):

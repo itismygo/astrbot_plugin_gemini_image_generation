@@ -1,8 +1,8 @@
-# AstrBot Gemini 图像生成插件 v1.5.4
+# AstrBot Gemini 图像生成插件 v1.5.5
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/Version-v1.5.4-blue)
+![Version](https://img.shields.io/badge/Version-v1.5.5-blue)
 ![License](https://img.shields.io/badge/License-MIT-orange)
 
 **🎨 强大的 Gemini 图像生成插件，支持智能头像参考和多模式生成**
@@ -63,6 +63,10 @@
 
 在插件配置中设置以下参数：
 
+- **api_settings.provider_id**: 从 AstrBot 提供商列表中选择模型（`_special: select_provider`），自动读取模型/密钥/端点；不选将无法调用，请先在 AstrBot 主配置中添加提供商
+- **html_render_options.quality**: HTML 帮助页截图质量（1-100，可选）
+- **参考图下载重试**: 参考图下载仅重试 1 次（超时/空文件会直接放弃，避免长时间卡住）
+
 <img width="1473" height="1386" alt="image" src="https://github.com/user-attachments/assets/0a469eea-c4bb-422b-9541-1eb61784e353" />
 <img width="1429" height="902" alt="image" src="https://github.com/user-attachments/assets/637fbfb8-8f93-4e00-960c-353d17a39c55" />
 
@@ -70,15 +74,8 @@
 
 ### API 配置
 
-#### Google 官方 API
-- **api_type**: `"google"`
-- **model**: `"gemini-3-pro-image-preview"` 或其他Gemini图像生成模型
-- **无需** 设置 `custom_api_base`
-
-#### OpenAI 兼容 API
-- **api_type**: `"openai"`
-- **model**: 任何支持的图像生成模型
-- **可选** 设置 `custom_api_base`
+- **api_type**: `"google"`/`"openai"`（可选），若未填写则随 AstrBot 提供商自动识别
+- **model**: 可选覆盖提供商模型；留空则使用提供商默认模型
 
 ### 限制/限流设置
 

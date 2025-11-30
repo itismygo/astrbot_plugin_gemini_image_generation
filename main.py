@@ -21,6 +21,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Reply
 from astrbot.api.star import Context, Star, register
+from astrbot.core.provider.entities import ProviderType
 
 from .tl import create_zip, split_image
 from .tl.enhanced_prompts import (
@@ -55,12 +56,22 @@ from .tl.tl_utils import (
     "astrbot_plugin_gemini_image_generation",
     "piexian",
     "Gemini图像生成插件，支持生图和改图，可以自动获取头像作为参考",
-    "v1.5.4",
+    "",
 )
 class GeminiImageGenerationPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any]):
         super().__init__(context)
         self.config = config
+        # 从 metadata.yaml 读取版本号
+        try:
+            metadata_path = os.path.join(os.path.dirname(__file__), "metadata.yaml")
+            with open(metadata_path, encoding="utf-8") as f:
+                metadata = yaml.safe_load(f) or {}
+                self.version = str(metadata.get("version", "")).strip()
+        except Exception:
+            self.version = ""
+        if not self.version:
+            self.version = "v1.0.0"
         self.api_client: APIClient | None = None
         self.avatar_manager = AvatarManager()
         self._cleanup_task: asyncio.Task | None = None
@@ -273,14 +284,17 @@ class GeminiImageGenerationPlugin(Star):
 
     def _load_config(self):
         """从配置加载所有设置"""
-        self.api_keys = self.config.get("openai_api_keys", [])
-        if not isinstance(self.api_keys, list):
-            self.api_keys = [self.api_keys] if self.api_keys else []
-
         api_settings = self.config.get("api_settings", {})
-        self.api_type = api_settings.get("api_type", "google")
-        self.api_base = api_settings.get("custom_api_base", "")
-        self.model = api_settings.get("model", "gemini-3-pro-image-preview")
+        provider_id = api_settings.get("provider_id") or ""
+        # 预先读取用户显式覆盖（如选择 openai、自定义 api_base/model）
+        manual_api_type = (api_settings.get("api_type") or "").strip()
+        manual_api_base = (api_settings.get("custom_api_base") or "").strip()
+        manual_model = (api_settings.get("model") or "").strip()
+        self.api_type = manual_api_type or ""
+        self.api_base = manual_api_base
+        self.model = manual_model or ""
+        # 统一从 AstrBot 提供商读取密钥/端点/模型
+        self.api_keys: list[str] = []
 
         image_settings = self.config.get("image_generation_settings", {})
         self.resolution = image_settings.get("resolution", "1K")
@@ -310,6 +324,20 @@ class GeminiImageGenerationPlugin(Star):
             "auto_avatar_reference", False
         )
         self.verbose_logging = service_settings.get("verbose_logging", False)
+        self.html_render_options = service_settings.get("html_render_options", {}) or {}
+        try:
+            quality_val = self.html_render_options.get("quality")
+            if quality_val is not None:
+                quality_int = int(quality_val)
+                if 1 <= quality_int <= 100:
+                    self.html_render_options["quality"] = quality_int
+                else:
+                    logger.warning("html_render_options.quality 超出范围(1-100)，已忽略")
+                    self.html_render_options.pop("quality", None)
+        except Exception:
+            logger.warning("解析 html_render_options 失败，已忽略质量设置")
+            self.html_render_options.pop("quality", None)
+
         limit_settings = self.config.get("limit_settings", {})
         raw_mode = str(limit_settings.get("group_limit_mode", "none")).lower()
         if raw_mode not in {"none", "whitelist", "blacklist"}:
@@ -343,6 +371,55 @@ class GeminiImageGenerationPlugin(Star):
         self._rate_limit_buckets: dict[str, list[float]] = {}
         self._rate_limit_lock = asyncio.Lock()
 
+        # 从 AstrBot 提供商管理器读取模型/密钥/端点
+        try:
+            provider_mgr = getattr(self.context, "provider_manager", None)
+            provider = None
+            if provider_mgr:
+                if provider_id and hasattr(provider_mgr, "inst_map"):
+                    provider = provider_mgr.inst_map.get(provider_id)
+                if not provider:
+                    provider = provider_mgr.get_using_provider(
+                        ProviderType.CHAT_COMPLETION, None
+                    )
+
+            if provider:
+                prov_type = str(provider.provider_config.get("type", "")).lower()
+                # 如果用户未显式选择 api_type，则按提供商类型推断
+                if not manual_api_type:
+                    if "googlegenai" in prov_type or "gemini" in prov_type:
+                        self.api_type = "google"
+                    elif "openai" in prov_type:
+                        self.api_type = "openai"
+                    else:
+                        logger.warning(
+                            f"提供商 {provider.provider_config.get('id')} 类型 {prov_type} 非Gemini/OpenAI，可能无法生成图像"
+                        )
+
+                prov_model = (
+                    provider.get_model()
+                    or provider.provider_config.get("model_config", {}).get("model")
+                )
+                # 若用户未手填模型，则使用提供商模型
+                if prov_model and not manual_model:
+                    self.model = prov_model
+
+                prov_keys = provider.get_keys() or []
+                self.api_keys = [str(k).strip() for k in prov_keys if str(k).strip()]
+
+                prov_base = provider.provider_config.get("api_base")
+                # 若用户未手填自定义 base，则使用提供商 base
+                if prov_base and not manual_api_base:
+                    self.api_base = prov_base
+
+                logger.info(
+                    f"✓ 已从 AstrBot 提供商读取配置，类型={self.api_type} 模型={self.model} 密钥={len(self.api_keys)}"
+                )
+            else:
+                logger.error("未找到可用的 AstrBot 提供商，无法读取模型/密钥，请在主配置中选择提供商")
+        except Exception as e:
+            logger.error(f"读取 AstrBot 提供商配置失败: {e}")
+
         if self.api_keys:
             self.api_client = get_api_client(self.api_keys)
             logger.info("✓ API 客户端已初始化")
@@ -352,7 +429,7 @@ class GeminiImageGenerationPlugin(Star):
             if self.api_base:
                 logger.info(f"  - 自定义 API Base: {self.api_base}")
         else:
-            logger.warning("✗ 未配置 API 密钥")
+            logger.error("✗ 未读取到 API 密钥，请确认 AstrBot 提供商中已配置 key")
 
     def log_info(self, message: str):
         """根据配置输出info或debug级别日志"""
@@ -960,10 +1037,12 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
     ):
         """
         根据内容数量选择发送模式：
-        - 单图：按原逻辑发送
-        - 总数<=4：链式发送
+        - 单图：链式富媒体发送（文本+图一起）
+        - 总数<=4：链式富媒体发送（文本+多图一起）
         - 总数>4：合并转发
         """
+        from astrbot.api import message_components as Comp
+
         cleaned_text = self._clean_text_content(text_content) if text_content else ""
         text_to_send = cleaned_text if (self.enable_text_response and cleaned_text) else ""
 
@@ -991,12 +1070,10 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         if len(available_images) == 1:
             logger.info("[SEND] 采用单图直发模式")
             if text_to_send:
-                from astrbot.api.message_components import Plain
-
-                # 同条消息发送文本+图片，减少拆分
+                # 富媒体链式发送：文本+图片
                 yield event.chain_result(
                     [
-                        Plain(f"📝 {text_to_send}"),
+                        Comp.Plain(f"\u200b📝 {text_to_send}"),
                         self._build_forward_image_component(available_images[0]),
                     ]
                 )
@@ -1008,18 +1085,21 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         # 短链顺序发送
         if total_items <= 4:
-            logger.info("[SEND] 采用短链顺序发送模式")
+            logger.info("[SEND] 采用短链富媒体发送模式")
+            chain: list = []
             if text_to_send:
-                yield event.plain_result(f"📝 {text_to_send}")
+                chain.append(Comp.Plain(f"\u200b📝 {text_to_send}"))
             for img in available_images:
-                yield event.image_result(img)
+                chain.append(self._build_forward_image_component(img))
+            if chain:
+                yield event.chain_result(chain)
             if thought_signature:
                 logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
             return
 
         # 合并转发
         logger.info("[SEND] 采用合并转发模式")
-        from astrbot.api.message_components import Node, Plain
+        from astrbot.api.message_components import Node, Plain, Image as AstrImage
 
         node_content = []
         if text_to_send:
@@ -1027,7 +1107,23 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         for idx, img in enumerate(available_images, 1):
             node_content.append(Plain(f"图片 {idx}:"))
-            node_content.append(self._build_forward_image_component(img))
+            # 直接使用 Image 组件构建群合并转发节点
+            try:
+                img_component = None
+                if img.startswith("file:///"):
+                    fs_path = img[8:]
+                    img_component = AstrImage.fromFileSystem(fs_path)
+                elif os.path.exists(img):
+                    img_component = AstrImage.fromFileSystem(img)
+                elif img.startswith(("http://", "https://")):
+                    img_component = AstrImage.fromURL(img)
+                else:
+                    img_component = AstrImage(file=img)
+
+                node_content.append(img_component)
+            except Exception as e:
+                logger.warning(f"构造合并转发图片节点失败: {e}")
+                node_content.append(Plain(f"[图片不可用: {img[:48]}]"))
 
         sender_id = "0"
         sender_name = "Gemini图像生成"
@@ -1037,11 +1133,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         except Exception:
             pass
 
-        node = Node(
-            uin=sender_id,
-            name=sender_name,
-            content=node_content,
-        )
+        node = Node(uin=sender_id, name=sender_name, content=node_content)
+        # 群合并转发需用 chain_result 包裹 Node
         yield event.chain_result([node])
 
         if thought_signature:
@@ -1621,7 +1714,19 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 jinja2_template = f.read()
 
             # 使用AstrBot的html_render方法
-            html_image_url = await self.html_render(jinja2_template, template_data)
+            render_opts = {}
+            if self.html_render_options.get("quality") is not None:
+                render_opts["quality"] = self.html_render_options["quality"]
+
+            try:
+                html_image_url = await self.html_render(
+                    jinja2_template,
+                    template_data,
+                    options=render_opts or None,
+                )
+            except TypeError:
+                # 兼容旧版不支持 options 的接口
+                html_image_url = await self.html_render(jinja2_template, template_data)
             logger.info(f"HTML帮助图片生成成功 (使用模板: {template_filename})")
             yield event.image_result(html_image_url)
 
