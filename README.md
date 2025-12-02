@@ -18,7 +18,7 @@
 - **改图模式**: 基于参考图像进行修改和风格转换，支持配置化头像参考
 - **换风格模式**: 专门的风格转换功能，支持配置化头像参考
 - **智能头像参考**: 自动获取用户头像和@指定对象头像作为参考，改图和换风格功能支持配置控制
-- **多API支持**: 兼容 Google 方方 API 和 OpenAI 兼容格式 API
+- **多API支持**: 兼容 Google 官方 API 和 OpenAI 兼容格式 API
 - **智能表情包切分**: 使用 SmartMemeSplitter 算法自动将生成的表情包网格切割为独立图片，支持合并转发和ZIP打包
 
 ### 🛡️ **限制/限流**
@@ -407,13 +407,13 @@
 - [NapCat](https://napneko.github.io/) - OneBot v11 实现
 
 **特别感谢**:
-- [MliKiowa](https://github.com/MliKiowa) - 图像切割算法提供者，为插件的智能表情包切分功能提供了重要的算法支持
+- [@MliKiowa](https://github.com/MliKiowa) - 图像切割算法提供者，为插件的智能表情包切分功能提供了重要的算法支持
 - [@exynos967](https://github.com/exynos967) - 多个重要功能和修复
  - **[PR#1](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/1)**: 限制/限流设置和手办化功能
  - **[PR#2](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/2)**: 兼容 OpenAI/Gemini混合url响应格式
  - **[PR#3](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/3)**: 兼容 OpenAI传入参数
  - **[PR#4](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/4)**: 手办化命令使用专用提示词
- - **[@zouyonghe](https://github.com/zouyonghe) - 新增代理支持
+ - [@zouyonghe](https://github.com/zouyonghe) - 新增代理支持，可选固定尺寸
  - **[PR#5](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/5)**: 为 Gemini API 添加代理支持
  - **[PR#6](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/6)**: 增加保留参考图尺寸开关，改图/换风格可沿用参考图分辨率
 
