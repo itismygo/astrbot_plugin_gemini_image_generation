@@ -1,13 +1,14 @@
 import zipfile
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any
 
-from PIL import Image
 import cv2
 import numpy as np
 
 from astrbot.api import logger
+
 from .tl_utils import get_plugin_data_dir
+
 
 class SmartMemeSplitter:
     """
@@ -49,7 +50,9 @@ class SmartMemeSplitter:
             logger.debug(f"FFT 去噪失败，回退原灰度图: {e}")
             return gray
 
-    def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def preprocess(
+        self, image: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         预处理：FFT 去噪 -> Canny 边缘 -> 二值化 + 形态学
 
@@ -62,7 +65,9 @@ class SmartMemeSplitter:
             bg = np.ones_like(image[:, :, :3], dtype=np.uint8) * 255
             img_rgb = image[:, :, :3]
             alpha_factor = alpha[:, :, np.newaxis].astype(np.float32) / 255.0
-            clean_img = (bg * (1 - alpha_factor) + img_rgb * alpha_factor).astype(np.uint8)
+            clean_img = (bg * (1 - alpha_factor) + img_rgb * alpha_factor).astype(
+                np.uint8
+            )
         else:
             clean_img = image.copy()
 
@@ -84,7 +89,7 @@ class SmartMemeSplitter:
 
         return clean_img, dilated, bin_img
 
-    def find_grid_lines(self, projection: np.ndarray, img_size: int) -> List[int]:
+    def find_grid_lines(self, projection: np.ndarray, img_size: int) -> list[int]:
         """
         基于投影找到网格分隔线（波谷位置）
 
@@ -96,7 +101,7 @@ class SmartMemeSplitter:
             网格线位置列表
         """
         # 平滑处理减少噪点
-        smooth = np.convolve(projection, np.ones(3)/3, mode='same')
+        smooth = np.convolve(projection, np.ones(3) / 3, mode="same")
 
         lines = [0]  # 起始边界
         is_gap = False
@@ -155,8 +160,13 @@ class SmartMemeSplitter:
         edge_ratio = edge_pixels / total_pixels if total_pixels > 0 else 1.0
         return edge_ratio <= max_edge_ratio
 
-    def refine_boundary(self, edges: np.ndarray, position: int,
-                       is_vertical: bool, search_range: int = 20) -> int:
+    def refine_boundary(
+        self,
+        edges: np.ndarray,
+        position: int,
+        is_vertical: bool,
+        search_range: int = 20,
+    ) -> int:
         """
         精细调整边界位置，找到最清晰的分隔线
 
@@ -171,7 +181,7 @@ class SmartMemeSplitter:
         """
         h, w = edges.shape
         best_pos = position
-        min_edges = float('inf')
+        min_edges = float("inf")
 
         # 双向搜索
         for offset in range(-search_range, search_range + 1):
@@ -194,7 +204,9 @@ class SmartMemeSplitter:
 
         return best_pos
 
-    def get_median_grid_size(self, boxes: List[Tuple[int, int, int, int]]) -> Tuple[float, float]:
+    def get_median_grid_size(
+        self, boxes: list[tuple[int, int, int, int]]
+    ) -> tuple[float, float]:
         """
         计算网格的中位数尺寸
 
@@ -215,9 +227,9 @@ class SmartMemeSplitter:
 
         return median_w, median_h
 
-    def generate_boxes_from_grid_lines(self, edges: np.ndarray,
-                                       row_lines: List[int],
-                                       col_lines: List[int]) -> List[Tuple[int, int, int, int]]:
+    def generate_boxes_from_grid_lines(
+        self, edges: np.ndarray, row_lines: list[int], col_lines: list[int]
+    ) -> list[tuple[int, int, int, int]]:
         """
         根据验证后的网格线生成边界框
 
@@ -265,7 +277,9 @@ class SmartMemeSplitter:
                 # 验证区域有足够内容（提高阈值）
                 roi = edges[y1:y2, x1:x2]
                 edge_density = np.sum(roi) / 255.0 / (box_w * box_h)  # 边缘密度
-                if np.sum(roi) / 255.0 > 500 and edge_density > 0.02:  # 有足够内容且密度足够
+                if (
+                    np.sum(roi) / 255.0 > 500 and edge_density > 0.02
+                ):  # 有足够内容且密度足够
                     boxes.append((x1, y1, box_w, box_h))
 
         return boxes
@@ -274,7 +288,7 @@ class SmartMemeSplitter:
         self,
         image: np.ndarray,
         debug: bool = False,
-    ) -> List[Tuple[int, int, int, int]]:
+    ) -> list[tuple[int, int, int, int]]:
         """
         检测网格并返回所有表情包的边界框
 
@@ -290,7 +304,7 @@ class SmartMemeSplitter:
         row_lines = self.find_grid_lines(row_proj, h)
 
         if debug:
-            logger.debug(f"检测到 {len(row_lines)-1} 行")
+            logger.debug(f"检测到 {len(row_lines) - 1} 行")
 
         boxes = []
         all_col_lines = set()  # 收集所有列线
@@ -336,7 +350,7 @@ class SmartMemeSplitter:
 
         # 阶段2：精细调整边界
         if debug:
-            logger.debug(f"=== 阶段2：精细调整 ===")
+            logger.debug("=== 阶段2：精细调整 ===")
 
         refined_boxes = []
         for x, y, w_box, h_box in boxes:
@@ -364,7 +378,7 @@ class SmartMemeSplitter:
             median_w, median_h = self.get_median_grid_size(refined_boxes)
 
             if debug:
-                logger.debug(f"=== 阶段3：处理过大网格 ===")
+                logger.debug("=== 阶段3：处理过大网格 ===")
                 logger.debug(f"标准网格尺寸: {median_w:.0f} x {median_h:.0f}")
 
             # 检测过大网格并计算需要细分的网格线
@@ -380,7 +394,9 @@ class SmartMemeSplitter:
 
                 if is_too_wide or is_too_tall:
                     if debug:
-                        logger.debug(f"检测到过大网格 ({w_box}x{h_box})，添加细分网格线...")
+                        logger.debug(
+                            f"检测到过大网格 ({w_box}x{h_box})，添加细分网格线..."
+                        )
 
                     # 添加细分的列线
                     if is_too_wide:
@@ -409,18 +425,21 @@ class SmartMemeSplitter:
 
         # 存储网格线信息供GUI使用
         self.last_row_lines = row_lines
-        self.last_col_lines = sorted(list(all_col_lines))
+        self.last_col_lines = sorted(all_col_lines)
 
         # 阶段4：根据最终网格线重新生成边界框
         if debug:
-            logger.debug(f"=== 阶段4：根据网格线生成最终边界框 ===")
+            logger.debug("=== 阶段4：根据网格线生成最终边界框 ===")
 
-        final_boxes = self.generate_boxes_from_grid_lines(edges, row_lines, sorted(list(all_col_lines)))
+        final_boxes = self.generate_boxes_from_grid_lines(
+            edges, row_lines, sorted(all_col_lines)
+        )
 
         if debug:
             logger.debug(f"最终生成 {len(final_boxes)} 个表情包")
 
         return final_boxes
+
 
 def split_image(
     image_path: str,
@@ -437,7 +456,7 @@ def split_image(
         rows: 保留参数以兼容旧接口（新方法中不再使用）
         cols: 保留参数以兼容旧接口（新方法中不再使用）
         output_dir: 输出目录，如果不指定则使用插件数据目录下的 split_output
-        bboxes: 保留参数以兼容旧接口（新方法中不再使用）
+        bboxes: 外部提供的裁剪框（x,y,width,height），优先使用
 
     Returns:
         List[str]: 切分后的图片文件路径列表，按顺序排列
@@ -462,9 +481,42 @@ def split_image(
             logger.error(f"无法读取图像: {image_path}")
             return []
 
-        # 使用 SmartMemeSplitter 进行智能切分
-        splitter = SmartMemeSplitter(min_gap=5, edge_threshold=10)
-        boxes = splitter.detect_grid(img, debug=True)
+        # 若传入外部裁剪框则优先使用，避免重复跑智能切分
+        boxes = []
+        if bboxes:
+            h, w = img.shape[:2]
+            for box in bboxes:
+                try:
+                    x = int(box.get("x", 0)) if isinstance(box, dict) else int(box[0])
+                    y = int(box.get("y", 0)) if isinstance(box, dict) else int(box[1])
+                    bw = (
+                        int(box.get("width", 0))
+                        if isinstance(box, dict)
+                        else int(box[2])
+                    )
+                    bh = (
+                        int(box.get("height", 0))
+                        if isinstance(box, dict)
+                        else int(box[3])
+                    )
+                except Exception as e:
+                    logger.debug(f"外部裁剪框解析失败，跳过: {e}")
+                    continue
+
+                x = max(0, x)
+                y = max(0, y)
+                bw = min(bw, w - x)
+                bh = min(bh, h - y)
+                if bw > 0 and bh > 0:
+                    boxes.append((x, y, bw, bh))
+
+            if boxes:
+                logger.debug(f"使用外部提供的裁剪框，共 {len(boxes)} 个")
+
+        # 如果没有外部裁剪框则使用 SmartMemeSplitter 进行智能切分
+        if not boxes:
+            splitter = SmartMemeSplitter(min_gap=5, edge_threshold=10)
+            boxes = splitter.detect_grid(img, debug=True)
 
         if not boxes:
             logger.warning("智能切分未检测到网格")

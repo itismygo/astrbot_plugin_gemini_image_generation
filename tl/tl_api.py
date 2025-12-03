@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from PIL import Image as PILImage
 
 from astrbot.api import logger
 
@@ -28,14 +27,14 @@ try:
     from .tl_utils import (
         IMAGE_CACHE_DIR,
         SUPPORTED_IMAGE_MIME_TYPES,
+        coerce_supported_image,
+        coerce_supported_image_bytes,
         encode_file_to_base64,
         get_plugin_data_dir,
+        normalize_image_input,
         save_base64_image,
         save_image_data,
         save_image_stream,
-        coerce_supported_image,
-        coerce_supported_image_bytes,
-        normalize_image_input,
     )
 except ImportError:
     from pathlib import Path
@@ -52,7 +51,9 @@ except ImportError:
         """占位符函数"""
         return None
 
-    async def save_image_stream(stream_reader, image_format: str = "png", target_path=None):
+    async def save_image_stream(
+        stream_reader, image_format: str = "png", target_path=None
+    ):
         return None
 
     def encode_file_to_base64(file_path, chunk_size: int = 65536) -> str:
@@ -76,7 +77,9 @@ except ImportError:
     def coerce_supported_image(mime_type, base64_data):
         return None, None
 
-    async def normalize_image_input(image_input: Any, *, image_cache_dir=None, image_input_mode="auto"):
+    async def normalize_image_input(
+        image_input: Any, *, image_cache_dir=None, image_input_mode="auto"
+    ):
         return None, None
 
 
@@ -162,7 +165,9 @@ class GeminiAPIClient:
         return coerce_supported_image_bytes(mime_type, raw_bytes)
 
     @staticmethod
-    def _coerce_supported_image(mime_type: str | None, base64_data: str) -> tuple[str | None, str | None]:
+    def _coerce_supported_image(
+        mime_type: str | None, base64_data: str
+    ) -> tuple[str | None, str | None]:
         return coerce_supported_image(mime_type, base64_data)
 
     async def get_next_api_key(self) -> str:
@@ -189,11 +194,17 @@ class GeminiAPIClient:
         """准备 Google 官方 API 请求负载（遵循官方规范）"""
         parts = [{"text": config.prompt}]
 
-        force_b64 = str(getattr(config, "image_input_mode", "auto")).lower() == "force_base64"
+        force_b64 = (
+            str(getattr(config, "image_input_mode", "auto")).lower() == "force_base64"
+        )
         enable_file_uri = (
             str(getattr(config, "image_input_mode", "auto")).lower() == "prefer_url"
         )
-        allowed_file_uri_hosts = {"storage.googleapis.com", "lh3.googleusercontent.com", "gstatic.com"}
+        allowed_file_uri_hosts = {
+            "storage.googleapis.com",
+            "lh3.googleusercontent.com",
+            "gstatic.com",
+        }
 
         if config.reference_images:
             for image_input in config.reference_images[:14]:
@@ -208,7 +219,10 @@ class GeminiAPIClient:
                     and parsed.netloc
                 ):
                     netloc = parsed.netloc.lower()
-                    if any(netloc == host or netloc.endswith("." + host) for host in allowed_file_uri_hosts):
+                    if any(
+                        netloc == host or netloc.endswith("." + host)
+                        for host in allowed_file_uri_hosts
+                    ):
                         parts.append({"fileData": {"fileUri": image_str}})
                         logger.debug(
                             "Gemini 官方接口使用 URL 参考图: %s",
@@ -222,7 +236,9 @@ class GeminiAPIClient:
                         )
 
                 # 其他情况：转换为支持的 base64
-                mime_type, data = await GeminiAPIClient._normalize_image_input(image_input)
+                mime_type, data = await GeminiAPIClient._normalize_image_input(
+                    image_input, image_input_mode=config.image_input_mode
+                )
                 if not data:
                     if force_b64:
                         raise APIError(
@@ -355,7 +371,10 @@ class GeminiAPIClient:
             {"type": "text", "text": f"Generate an image: {config.prompt}"}
         ]
 
-        force_b64 = str(getattr(config, "image_input_mode", "auto")).lower() == "force_base64"
+        force_b64 = (
+            str(getattr(config, "image_input_mode", "auto")).lower() == "force_base64"
+        )
+
         def _ensure_valid_base64(data: str, context: str):
             try:
                 cleaned = data.strip().replace("\n", "")
@@ -405,7 +424,11 @@ class GeminiAPIClient:
 
                 try:
                     # 优先处理 http(s) URL，确保 scheme 和 netloc 合法
-                    if parsed.scheme in ("http", "https") and parsed.netloc and not force_b64:
+                    if (
+                        parsed.scheme in ("http", "https")
+                        and parsed.netloc
+                        and not force_b64
+                    ):
                         ext = Path(parsed.path).suffix.lower().lstrip(".")
                         if ext and ext not in supported_exts:
                             logger.debug(
@@ -427,7 +450,9 @@ class GeminiAPIClient:
                         )
 
                     # data URL：直接校验 base64，有效则不再重复转码
-                    elif image_str.startswith("data:image/") and ";base64," in image_str:
+                    elif (
+                        image_str.startswith("data:image/") and ";base64," in image_str
+                    ):
                         header, _, data_part = image_str.partition(";base64,")
                         mime_type = header.replace("data:", "").lower()
                         try:
@@ -442,7 +467,9 @@ class GeminiAPIClient:
                             ext = mime_type.split("/")[-1]
                             if ext and ext not in supported_exts:
                                 logger.debug(
-                                    "data URL 图片格式不常见: idx=%s mime=%s", idx, mime_type
+                                    "data URL 图片格式不常见: idx=%s mime=%s",
+                                    idx,
+                                    mime_type,
                                 )
                             image_payload = {
                                 "type": "image_url",
@@ -457,7 +484,7 @@ class GeminiAPIClient:
                     # 其他输入交给规范化逻辑，自动转换为 data URL
                     else:
                         mime_type, data = await GeminiAPIClient._normalize_image_input(
-                            image_input
+                            image_input, image_input_mode=config.image_input_mode
                         )
                         if not data:
                             if force_b64:
@@ -561,14 +588,15 @@ class GeminiAPIClient:
         return payload
 
     @staticmethod
-    async def _normalize_image_input(image_input: Any) -> tuple[str | None, str | None]:
+    async def _normalize_image_input(
+        image_input: Any, image_input_mode: str = "auto"
+    ) -> tuple[str | None, str | None]:
         """统一调用 tl_utils 的参考图规范化逻辑"""
         return await normalize_image_input(
             image_input,
             image_cache_dir=IMAGE_CACHE_DIR,
-            image_input_mode="auto",
+            image_input_mode=image_input_mode,
         )
-
 
     async def _get_api_url(
         self, config: ApiRequestConfig
@@ -909,7 +937,9 @@ class GeminiAPIClient:
                                 image_paths.append(saved_path)
                                 image_urls.append(saved_path)
                         else:
-                            logger.warning(f"候选 {idx} 的第 {i} 个part有inlineData但data为空")
+                            logger.warning(
+                                f"候选 {idx} 的第 {i} 个part有inlineData但data为空"
+                            )
                     elif "thought" in part and part.get("thought", False):
                         logger.debug(f"候选 {idx} 的第 {i} 个part是思考内容")
                     elif "text" in part and not part.get("thought", False):
@@ -925,6 +955,20 @@ class GeminiAPIClient:
 
         logger.debug(f"🖼️ 共找到 {len(image_paths)} 张图片")
 
+        # 文本中尝试解析可能的图像URL或Base64（用于只返回文本的情况）
+        if text_chunks:
+            extracted_urls: list[str] = []
+            extracted_paths: list[str] = []
+            for chunk in text_chunks:
+                extracted_urls.extend(self._find_image_urls_in_text(chunk))
+                urls2, paths2 = await self._extract_from_content(chunk)
+                extracted_urls.extend(urls2)
+                extracted_paths.extend(paths2)
+
+            if extracted_urls or extracted_paths:
+                image_urls.extend(extracted_urls)
+                image_paths.extend(extracted_paths)
+
         text_content = (
             " ".join(chunk for chunk in text_chunks if chunk).strip()
             if text_chunks
@@ -933,7 +977,7 @@ class GeminiAPIClient:
         if text_content:
             logger.debug(f"🎯 找到文本内容: {text_content[:100]}...")
 
-        if image_paths:
+        if image_paths or image_urls:
             parse_end = asyncio.get_event_loop().time()
             logger.debug(f"🎉 API响应解析完成，总耗时: {parse_end - parse_start:.2f}秒")
             return image_urls, image_paths, text_content, thought_signature
@@ -1081,7 +1125,9 @@ class GeminiAPIClient:
                         image_paths.append(image_path)
 
         if image_urls or image_paths:
-            logger.debug(f"🖼️ OpenAI 收集到 {len(image_paths) or len(image_urls)} 张图片")
+            logger.debug(
+                f"🖼️ OpenAI 收集到 {len(image_paths) or len(image_urls)} 张图片"
+            )
             return image_urls, image_paths, text_content, thought_signature
 
         # 如果只有文本内容，也返回
@@ -1117,11 +1163,9 @@ class GeminiAPIClient:
 
         return None, None
 
-    async def _extract_from_content(
-        self, content: str
-    ) -> tuple[list[str], list[str]]:
+    async def _extract_from_content(self, content: str) -> tuple[list[str], list[str]]:
         """从文本内容中提取所有 data URI 图像，保持顺序"""
-        pattern = r"data:image/([^;]+);base64,([A-Za-z0-9+/=\s]+)"
+        pattern = r"data\s*:\s*image/([^;]+);\s*base64,\s*([A-Za-z0-9+/=\s]+)"
         matches = re.findall(pattern, content)
 
         image_urls: list[str] = []
@@ -1144,16 +1188,29 @@ class GeminiAPIClient:
 
         # Markdown 图片语法与裸露的图片链接
         markdown_pattern = r"!\[[^\]]*\]\((https?://[^)]+)\)"
-        raw_pattern = r"(https?://[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|tiff|avif))(?:\b|$)"
+        raw_pattern = (
+            r"(https?://[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|tiff|avif))(?:\b|$)"
+        )
+        spaced_pattern = r"(https?\s*:\s*/\s*/[^\s)]+)"
 
         urls: list[str] = []
         seen: set[str] = set()
+
+        def _push(candidate: str):
+            cleaned = candidate.strip().replace("&amp;", "&").rstrip(").,;")
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                urls.append(cleaned)
+
         for pattern in (markdown_pattern, raw_pattern):
             for match in re.findall(pattern, text, flags=re.IGNORECASE):
-                cleaned = match.strip().replace("&amp;", "&")
-                if cleaned not in seen:
-                    seen.add(cleaned)
-                    urls.append(cleaned)
+                _push(match)
+
+        # 适配带空格的 http:// 片段（如 "http: //1. 2. 3. 4/image.png"）
+        for match in re.findall(spaced_pattern, text, flags=re.IGNORECASE):
+            compact = re.sub(r"\s+", "", match)
+            if compact.lower().startswith(("http://", "https://")):
+                _push(compact)
 
         return urls
 
@@ -1164,7 +1221,9 @@ class GeminiAPIClient:
         use_cache: bool = False,
     ) -> tuple[str | None, str | None]:
         """下载并保存图像，可选择是否使用缓存（默认关闭以避免返回旧图）"""
-        cleaned_url = image_url.replace("&amp;", "&") if isinstance(image_url, str) else image_url
+        cleaned_url = (
+            image_url.replace("&amp;", "&") if isinstance(image_url, str) else image_url
+        )
         parsed = urllib.parse.urlparse(cleaned_url)
         is_http = parsed.scheme in {"http", "https"}
         cache_key = (
@@ -1225,9 +1284,7 @@ class GeminiAPIClient:
                             err_text = ""
 
                         response_reason = response.reason or ""
-                        response_content_type = response.headers.get(
-                            "Content-Type", ""
-                        )
+                        response_content_type = response.headers.get("Content-Type", "")
                         query_params = urllib.parse.parse_qs(parsed.query)
                         param_issues: list[str] = []
 
@@ -1260,7 +1317,10 @@ class GeminiAPIClient:
                         err_lower = err_text.lower() if err_text else ""
                         if any(keyword in err_lower for keyword in ["auth", "key"]):
                             suggestions.append("认证错误 → 检查API密钥")
-                        if any(keyword in err_lower for keyword in ["limit", "频率", "限制"]):
+                        if any(
+                            keyword in err_lower
+                            for keyword in ["limit", "频率", "限制"]
+                        ):
                             suggestions.append("服务器限制 → 建议稍后重试")
                         if not suggestions:
                             suggestions.append("服务器限制 → 建议稍后重试")
@@ -1277,10 +1337,14 @@ class GeminiAPIClient:
                         if self.verbose_logging:
                             logger.debug(
                                 "HTTP 400 参数检查结果: %s",
-                                "; ".join(param_issues) if param_issues else "未发现明显异常",
+                                "; ".join(param_issues)
+                                if param_issues
+                                else "未发现明显异常",
                             )
                             logger.debug("完整请求头: %s", headers or {})
-                            logger.debug("User-Agent: %s", (headers or {}).get("User-Agent", ""))
+                            logger.debug(
+                                "User-Agent: %s", (headers or {}).get("User-Agent", "")
+                            )
                             logger.debug(
                                 "Content-Type: %s, Accept: %s",
                                 (headers or {}).get("Content-Type", "未设置"),

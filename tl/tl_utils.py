@@ -42,7 +42,9 @@ SUPPORTED_IMAGE_MIME_TYPES = {
 }
 
 
-def _build_image_path(image_format: str = "png", prefix: str = "gemini_advanced_image") -> Path:
+def _build_image_path(
+    image_format: str = "png", prefix: str = "gemini_advanced_image"
+) -> Path:
     """生成规范的图片路径，避免重复逻辑"""
     images_dir = get_plugin_data_dir() / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -286,17 +288,16 @@ async def download_qq_avatar(
         if bot:
             group_id = None
             try:
-                raw_group_id = getattr(event, "group_id", None) or getattr(
-                    event, "get_group_id", lambda: None
-                )()
+                raw_group_id = (
+                    getattr(event, "group_id", None)
+                    or getattr(event, "get_group_id", lambda: None)()
+                )
                 group_id = int(raw_group_id) if raw_group_id else None
             except Exception:
                 group_id = None
 
             actions: list[tuple[str, dict]] = []
-            actions.append(
-                ("get_avatar", {"user_id": int(user_id), "img_type": "640"})
-            )
+            actions.append(("get_avatar", {"user_id": int(user_id), "img_type": "640"}))
             actions.append(
                 ("get_user_avatar", {"user_id": int(user_id), "img_type": "640"})
             )
@@ -304,7 +305,11 @@ async def download_qq_avatar(
                 actions.append(
                     (
                         "get_group_member_info",
-                        {"group_id": group_id, "user_id": int(user_id), "no_cache": False},
+                        {
+                            "group_id": group_id,
+                            "user_id": int(user_id),
+                            "no_cache": False,
+                        },
                     )
                 )
             actions.append(
@@ -315,7 +320,9 @@ async def download_qq_avatar(
                 try:
                     resp = await bot.call_action(action, **payload)
                     url = None
-                    if isinstance(resp, str) and resp.startswith(("http://", "https://")):
+                    if isinstance(resp, str) and resp.startswith(
+                        ("http://", "https://")
+                    ):
                         url = resp
                     elif isinstance(resp, dict):
                         url = _pick_avatar_url(resp)
@@ -397,9 +404,7 @@ async def download_qq_avatar(
                         logger.debug(f"头像下载成功: {cache_name}")
                         return base64_data
                 except Exception as e:
-                    logger.warning(
-                        f"下载头像异常: {e} (尝试 {attempt}/{max_retries})"
-                    )
+                    logger.warning(f"下载头像异常: {e} (尝试 {attempt}/{max_retries})")
                     if attempt < max_retries:
                         await asyncio.sleep(retry_interval * attempt)
                         continue
@@ -556,9 +561,7 @@ async def collect_image_sources(event, log_debug=logger.debug) -> list[str]:
 
                 # 文件组件（尝试按图片处理）
                 if comp.__class__.__name__ == "File":
-                    file_val = getattr(comp, "file", None) or getattr(
-                        comp, "url", None
-                    )
+                    file_val = getattr(comp, "file", None) or getattr(comp, "url", None)
                     add_source(file_val, origin)
                     continue
 
@@ -575,9 +578,7 @@ async def collect_image_sources(event, log_debug=logger.debug) -> list[str]:
 
                 # Nodes（多个节点）
                 if comp.__class__.__name__ == "Nodes":
-                    nodes = getattr(comp, "nodes", None) or getattr(
-                        comp, "list", None
-                    )
+                    nodes = getattr(comp, "nodes", None) or getattr(comp, "list", None)
                     extract_from_components(nodes, "合并转发")
                     continue
             except Exception as e:
@@ -603,7 +604,9 @@ def coerce_supported_image_bytes(
     """
     normalized_mime = (mime_type or "").lower()
     target_mime = (
-        normalized_mime if normalized_mime in SUPPORTED_IMAGE_MIME_TYPES else "image/png"
+        normalized_mime
+        if normalized_mime in SUPPORTED_IMAGE_MIME_TYPES
+        else "image/png"
     )
     try:
         with PILImage.open(io.BytesIO(raw_bytes)) as img:
@@ -735,9 +738,7 @@ async def normalize_image_input(
             timeout = aiohttp.ClientTimeout(total=20, connect=10)
             max_retries = 1
             trust_env = (
-                False
-                if (parsed_url.netloc and "qq.com" in parsed_url.netloc)
-                else True
+                False if (parsed_url.netloc and "qq.com" in parsed_url.netloc) else True
             )
 
             async with aiohttp.ClientSession(
@@ -800,6 +801,8 @@ async def normalize_image_input(
     except Exception as e:
         logger.error(f"规范化参考图输入失败: {e}")
         return None, None
+
+
 async def resolve_image_source_to_path(
     source: str,
     *,
@@ -845,7 +848,7 @@ async def resolve_image_source_to_path(
                 if ";base64," in src:
                     _, _, b64_data = src.partition(";base64,")
                 data = base64.b64decode(b64_data)
-                tmp_path = Path("/tmp") / f"cut_{int(time.time()*1000)}.png"
+                tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                 tmp_path.write_bytes(data)
                 # 验证图片可读
                 if cv2.imread(str(tmp_path)) is None:
@@ -887,7 +890,9 @@ async def resolve_image_source_to_path(
                     data_url = await download_qq_image_fn(src)
 
                 if not data_url and api_client:
-                    mime_type, b64 = await api_client._normalize_image_input(src)
+                    mime_type, b64 = await api_client._normalize_image_input(
+                        src, image_input_mode=image_input_mode
+                    )
                     if b64:
                         data_url = (
                             b64
@@ -921,7 +926,7 @@ async def resolve_image_source_to_path(
                         b64_part = data_url
                         if ";base64," in data_url:
                             _, _, b64_part = data_url.partition(";base64,")
-                        tmp_path = Path("/tmp") / f"cut_{int(time.time()*1000)}.png"
+                        tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                         tmp_path.write_bytes(base64.b64decode(b64_part))
                         if cv2.imread(str(tmp_path)) is not None:
                             return str(tmp_path)
@@ -935,7 +940,7 @@ async def resolve_image_source_to_path(
     try:
         base64.b64decode(src, validate=True)
         data = base64.b64decode(src)
-        tmp_path = Path("/tmp") / f"cut_{int(time.time()*1000)}.png"
+        tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
         tmp_path.write_bytes(data)
         if cv2.imread(str(tmp_path)) is not None:
             return str(tmp_path)
@@ -1011,6 +1016,8 @@ def download_qq_avatar_legacy(user_id: str, cache_name: str, event=None) -> str 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(download_qq_avatar(user_id, cache_name, event=event))
+        return loop.run_until_complete(
+            download_qq_avatar(user_id, cache_name, event=event)
+        )
     finally:
         loop.close()

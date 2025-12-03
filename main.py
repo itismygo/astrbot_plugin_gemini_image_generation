@@ -351,7 +351,9 @@ class GeminiImageGenerationPlugin(Star):
                 if 1 <= quality_int <= 100:
                     self.html_render_options["quality"] = quality_int
                 else:
-                    logger.warning("html_render_options.quality 超出范围(1-100)，已忽略")
+                    logger.warning(
+                        "html_render_options.quality 超出范围(1-100)，已忽略"
+                    )
                     self.html_render_options.pop("quality", None)
         except Exception:
             logger.warning("解析 html_render_options 失败，已忽略质量设置")
@@ -590,7 +592,9 @@ class GeminiImageGenerationPlugin(Star):
 
             cleaned = img.strip()
             if force_b64 and cleaned.lower().startswith("data:"):
-                self.log_debug(f"跳过 data URL（force_base64 模式）({source}): {cleaned[:64]}...")
+                self.log_debug(
+                    f"跳过 data URL（force_base64 模式）({source}): {cleaned[:64]}..."
+                )
                 continue
 
             if self._is_valid_base64_image_str(cleaned):
@@ -600,9 +604,7 @@ class GeminiImageGenerationPlugin(Star):
             ):
                 valid.append(cleaned)
             else:
-                self.log_debug(
-                    f"跳过非支持格式参考图像({source}): {cleaned[:64]}..."
-                )
+                self.log_debug(f"跳过非支持格式参考图像({source}): {cleaned[:64]}...")
 
         return valid
 
@@ -651,18 +653,18 @@ class GeminiImageGenerationPlugin(Star):
 
             if len(bucket) >= self.max_requests_per_group:
                 earliest = bucket[0]
-        retry_after = int(earliest + self.rate_limit_period - now)
-        if retry_after < 0:
-            retry_after = 0
+                retry_after = int(earliest + self.rate_limit_period - now)
+                if retry_after < 0:
+                    retry_after = 0
 
-        self._rate_limit_buckets[group_id] = bucket
-        return (
-            False,
-            f"⏱️ 本群在最近 {self.rate_limit_period} 秒内的生图请求次数已达上限（{self.max_requests_per_group} 次），请约 {retry_after} 秒后再试。",
-        )
+                self._rate_limit_buckets[group_id] = bucket
+                return (
+                    False,
+                    f"⏱️ 本群在最近 {self.rate_limit_period} 秒内的生图请求次数已达上限（{self.max_requests_per_group} 次），请约 {retry_after} 秒后再试。",
+                )
 
-        bucket.append(now)
-        self._rate_limit_buckets[group_id] = bucket
+            bucket.append(now)
+            self._rate_limit_buckets[group_id] = bucket
 
         return True, None
 
@@ -685,7 +687,9 @@ class GeminiImageGenerationPlugin(Star):
             if self.api_client:
                 logger.info("✓ AstrBot 加载完成后已成功初始化 API 客户端")
             else:
-                logger.error("✗ AstrBot 加载完成后仍未初始化 API 客户端，请检查提供商配置")
+                logger.error(
+                    "✗ AstrBot 加载完成后仍未初始化 API 客户端，请检查提供商配置"
+                )
 
     def _ensure_api_client(self) -> bool:
         """确保 API 客户端已初始化，启动初期 provider_mgr 可能尚未就绪"""
@@ -738,10 +742,9 @@ class GeminiImageGenerationPlugin(Star):
                             f"提供商 {provider.provider_config.get('id')} 类型 {prov_type} 非Gemini/OpenAI，可能无法生成图像"
                         )
 
-                prov_model = (
-                    provider.get_model()
-                    or provider.provider_config.get("model_config", {}).get("model")
-                )
+                prov_model = provider.get_model() or provider.provider_config.get(
+                    "model_config", {}
+                ).get("model")
                 # 若用户未手填模型，则使用提供商模型
                 if prov_model and not manual_model and not self.model:
                     self.model = prov_model
@@ -749,7 +752,9 @@ class GeminiImageGenerationPlugin(Star):
                 prov_keys = provider.get_keys() or []
                 # 避免重复覆盖已有非空密钥
                 if not self.api_keys:
-                    self.api_keys = [str(k).strip() for k in prov_keys if str(k).strip()]
+                    self.api_keys = [
+                        str(k).strip() for k in prov_keys if str(k).strip()
+                    ]
 
                 prov_base = provider.provider_config.get("api_base")
                 # 若用户未手填自定义 base，则使用提供商 base
@@ -760,7 +765,9 @@ class GeminiImageGenerationPlugin(Star):
                     f"✓ 已从 AstrBot 提供商读取配置，类型={self.api_type} 模型={self.model} 密钥={len(self.api_keys)}"
                 )
             else:
-                logger.error("未找到可用的 AstrBot 提供商，无法读取模型/密钥，请在主配置中选择提供商")
+                logger.error(
+                    "未找到可用的 AstrBot 提供商，无法读取模型/密钥，请在主配置中选择提供商"
+                )
         except Exception as e:
             logger.error(f"读取 AstrBot 提供商配置失败: {e}")
 
@@ -793,7 +800,9 @@ class GeminiImageGenerationPlugin(Star):
                 headers["Referer"] = "https://qun.qq.com"
 
             timeout = aiohttp.ClientTimeout(total=12, connect=5)
-            async with aiohttp.ClientSession(headers=headers, trust_env=True) as session:
+            async with aiohttp.ClientSession(
+                headers=headers, trust_env=True
+            ) as session:
                 async with session.get(url, timeout=timeout) as resp:
                     if resp.status != 200:
                         logger.warning(
@@ -914,7 +923,10 @@ class GeminiImageGenerationPlugin(Star):
                     if not self.api_client:
                         logger.warning("API 客户端未初始化，无法转换图片为base64")
                         return None
-                    mime_type, base64_data = await self.api_client._normalize_image_input(
+                    (
+                        mime_type,
+                        base64_data,
+                    ) = await self.api_client._normalize_image_input(
                         candidate, image_input_mode=image_mode
                     )
                     if base64_data:
@@ -1080,7 +1092,9 @@ class GeminiImageGenerationPlugin(Star):
                 f"📸 已收集图片: 消息 {len(message_images)} 张，头像 {len(avatar_images)} 张"
             )
         else:
-            logger.info("📸 未收集到有效参考图片，若需参考图可直接发送图片或检查网络权限")
+            logger.info(
+                "📸 未收集到有效参考图片，若需参考图可直接发送图片或检查网络权限"
+            )
 
         return message_images, avatar_images
 
@@ -1196,7 +1210,10 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     continue
                 if Path(img_path).exists():
                     resolved_path = img_path
-                    if self.nap_server_address and self.nap_server_address != "localhost":
+                    if (
+                        self.nap_server_address
+                        and self.nap_server_address != "localhost"
+                    ):
                         logger.info(f"📤 开始传输第 {idx + 1} 张图片到远程服务器...")
                         try:
                             remote_path = await asyncio.wait_for(
@@ -1242,7 +1259,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return False, error_msg
 
         except APIError as e:
-            status_part = f"（状态码 {e.status_code}）" if e.status_code is not None else ""
+            status_part = (
+                f"（状态码 {e.status_code}）" if e.status_code is not None else ""
+            )
             error_msg = f"❌ 图像生成失败{status_part}：{e.message}"
             if e.status_code == 429:
                 error_msg += "\n🧐 可能原因：请求过于频繁或额度已用完。\n✅ 建议：稍等片刻再试，或在配置中增加可用额度/开启智能重试。"
@@ -1319,7 +1338,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         from astrbot.api import message_components as Comp
 
         cleaned_text = self._clean_text_content(text_content) if text_content else ""
-        text_to_send = cleaned_text if (self.enable_text_response and cleaned_text) else ""
+        text_to_send = (
+            cleaned_text if (self.enable_text_response and cleaned_text) else ""
+        )
 
         available_images = self._merge_available_images(image_paths, image_urls)
         total_items = len(available_images) + (1 if text_to_send else 0)
@@ -1330,7 +1351,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         if not available_images:
             if cleaned_text:
-                yield event.plain_result("⚠️ 当前模型只返回了文本，请检查模型配置或者重试")
+                yield event.plain_result(
+                    "⚠️ 当前模型只返回了文本，请检查模型配置或者重试"
+                )
                 if text_to_send:
                     yield event.plain_result(f"📝 {text_to_send}")
             else:
@@ -1683,9 +1706,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             p_lower = prompt.lower()
             if p_lower.startswith("1") or "pvc" in p_lower:
                 style_type = 1
-                clean_prompt = (
-                    prompt.replace("1", "", 1).replace("pvc", "", 1).strip()
-                )
+                clean_prompt = prompt.replace("1", "", 1).replace("pvc", "", 1).strip()
             elif p_lower.startswith("2") or "gk" in p_lower:
                 style_type = 2
                 clean_prompt = prompt.replace("2", "", 1).replace("gk", "", 1).strip()
@@ -1702,7 +1723,6 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             skip_figure_enhance=True,
         ):
             yield result
-
 
     @quick_mode_group.command("表情包")
     async def quick_sticker(self, event: AstrMessageEvent, prompt: str = ""):
@@ -1840,18 +1860,14 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     try:
                         from astrbot.api.message_components import File
 
-                        file_comp = File(
-                            file=zip_path, name=os.path.basename(zip_path)
-                        )
+                        file_comp = File(file=zip_path, name=os.path.basename(zip_path))
                         yield event.chain_result([file_comp])
                         sent_success = True
 
                         yield event.image_result(primary_image_path)
                     except Exception as e:
                         logger.warning(f"发送ZIP失败: {e}")
-                        yield event.plain_result(
-                            "⚠️ 压缩包发送失败，降级使用合并转发"
-                        )
+                        yield event.plain_result("⚠️ 压缩包发送失败，降级使用合并转发")
                         sent_success = False
                 else:
                     yield event.plain_result(
@@ -1927,7 +1943,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     if ";base64," in src:
                         _, _, b64_data = src.partition(";base64,")
                     data = base64.b64decode(b64_data)
-                    tmp_path = Path("/tmp") / f"cut_{int(time.time()*1000)}.png"
+                    tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                     tmp_path.write_bytes(data)
                     local_path = str(tmp_path)
                 # 3) URL 下载（含 qpic/nt.qq 直链）
@@ -1949,13 +1965,13 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         if ";base64," in data_url:
                             _, _, b64_data = data_url.partition(";base64,")
                         data = base64.b64decode(b64_data)
-                        tmp_path = Path("/tmp") / f"cut_{int(time.time()*1000)}.png"
+                        tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                         tmp_path.write_bytes(data)
                         local_path = str(tmp_path)
                 # 4) 其他字符串尝试当作 base64
                 elif isinstance(src, str):
                     data = base64.b64decode(src)
-                    tmp_path = Path("/tmp") / f"cut_{int(time.time()*1000)}.png"
+                    tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                     tmp_path.write_bytes(data)
                     local_path = str(tmp_path)
             except Exception as e:
@@ -1973,7 +1989,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         split_files: list[str] = []
         try:
-            split_files = await asyncio.to_thread(split_image, local_path, rows=6, cols=4)
+            split_files = await asyncio.to_thread(
+                split_image, local_path, rows=6, cols=4
+            )
         except Exception as e:
             logger.error(f"切割图片时发生异常: {e}")
             split_files = []

@@ -55,9 +55,8 @@ def get_mobile_prompt(prompt: str) -> str:
 def get_sticker_prompt(prompt: str = "") -> str:
     """获取表情包提示词"""
     base_prompt = """为我生成图中角色的绘制 Q 版的，LINE 风格的半身像表情包，注意头饰要正确
-彩色手绘风格，使用均匀的 4x6 line grid layout，涵盖各种各样的常用聊天语句，或是一些有关的娱乐 meme
-其他需求：不要原图复制。所有标注为手写简体中文并在grid layout中。
-生成的图片需为 4K 分辨率 16:9
+彩色手绘风格，严格按照6*4布局均匀分布，白色背景，涵盖各种各样的常用聊天语句，或是一些有关的娱乐 meme
+其他需求：不要原图复制，高清修复，高质量。所有标注为手写的简体中文。
 """
 
     if prompt:
@@ -166,7 +165,7 @@ def get_sticker_bbox_prompt(rows: int = 6, cols: int = 4) -> str:
 2. 输出 JSON 数组，元素格式：{{"x":像素,"y":像素,"width":像素,"height":像素}}，不需要其他字段，不要加代码块/注释。
 3. 坐标以像素为单位，x/y 为左上角位置，width/height 为宽高，尽量贴合每个表情图边界。
 4. 保证每个角色/表情图完整不被截断，框内包含完整人物和文字，不要裁掉头手等关键部位。
-5. 若网格不齐或存在空白，请仍按可见子图顺序给出裁剪框，最多 {rows*cols} 个。
+5. 若网格不齐或存在空白，请仍按可见子图顺序给出裁剪框，最多 {rows * cols} 个。
 6. 只输出 JSON，勿返回多余说明。
 """
 
@@ -178,7 +177,9 @@ def enhance_prompt_for_figure(prompt: str) -> str:
 
 def get_q_version_sticker_prompt(prompt: str = "") -> str:
     """英文版Q版表情包提示词"""
-    base_prompt = """Generate a chibi-style drawing of the character in the image, using the LINE-style, with a half-body expression, and ensure the head accessories are accurate.\nUse a colorful hand-drawn style, strictly following a 4×4 LINE grid layout, with a pure white background.\nInclude various common chat phrases or related humorous memes.\nAdditional requirements: Do NOT copy the original image; reproduce it in high resolution and high quality.\nAll annotations should be simple symbols or English, and must be placed within the LINE grid layout."""
+    base_prompt = """Generate a Q version drawing of the characters in the image, in LINE style, with half-body expressions, ensuring the headgear is correct.
+Color hand-drawn style, strictly following a 6*4 layout evenly distributed, with a white background, covering a variety of commonly used chat phrases or some related entertainment memes.
+Other requirements: Do not copy the original image, high-definition restoration, high quality. All annotations should be simple symbols or in English."""
 
     if prompt.strip():
         return f"{base_prompt}\n\nAdditional user requirements: {prompt}"
