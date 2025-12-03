@@ -222,7 +222,9 @@ class GeminiAPIClient:
                         )
 
                 # 其他情况：转换为支持的 base64
-                mime_type, data = await GeminiAPIClient._normalize_image_input(image_input)
+                mime_type, data = await GeminiAPIClient._normalize_image_input(
+                    image_input, image_input_mode=config.image_input_mode
+                )
                 if not data:
                     if force_b64:
                         raise APIError(
@@ -457,7 +459,7 @@ class GeminiAPIClient:
                     # 其他输入交给规范化逻辑，自动转换为 data URL
                     else:
                         mime_type, data = await GeminiAPIClient._normalize_image_input(
-                            image_input
+                            image_input, image_input_mode=config.image_input_mode
                         )
                         if not data:
                             if force_b64:
@@ -561,12 +563,14 @@ class GeminiAPIClient:
         return payload
 
     @staticmethod
-    async def _normalize_image_input(image_input: Any) -> tuple[str | None, str | None]:
+    async def _normalize_image_input(
+        image_input: Any, image_input_mode: str = "auto"
+    ) -> tuple[str | None, str | None]:
         """统一调用 tl_utils 的参考图规范化逻辑"""
         return await normalize_image_input(
             image_input,
             image_cache_dir=IMAGE_CACHE_DIR,
-            image_input_mode="auto",
+            image_input_mode=image_input_mode,
         )
 
 
