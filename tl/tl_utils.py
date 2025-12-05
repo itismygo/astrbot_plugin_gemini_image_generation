@@ -197,53 +197,65 @@ async def save_image_data(image_data: bytes, image_format: str = "png") -> str |
 
 async def cleanup_old_images(images_dir: Path | None = None):
     """
-    清理超过5分钟的图像文件
+    清理超过5分钟的图像文件和缓存
 
     Args:
         images_dir (Path): images 目录路径，如果为None则使用默认路径
     """
     try:
-        # 默认路径：插件根目录下的 images 文件夹
+        plugin_data_dir = get_plugin_data_dir()
         if images_dir is None:
-            images_dir = get_plugin_data_dir() / "images"
-
-        if not images_dir.exists():
-            return
+            images_dir = plugin_data_dir / "images"
 
         current_time = datetime.now()
         cutoff_time = current_time - timedelta(minutes=5)
-
-        # 查找 images 目录下的所有图像文件（支持新旧两种命名格式）
-        image_patterns = [
-            "gemini_image_*.png",  # 旧格式
-            "gemini_image_*.jpg",
-            "gemini_image_*.jpeg",
-            "gemini_advanced_image_*.png",  # 新格式
-            "gemini_advanced_image_*.jpg",
-            "gemini_advanced_image_*.jpeg",
-        ]
-
         cleaned_count = 0
-        for pattern in image_patterns:
-            for file_path in images_dir.glob(pattern):
-                try:
-                    # 获取文件的修改时间
-                    file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
 
-                    # 如果文件超过15分钟，删除它
-                    if file_mtime < cutoff_time:
-                        file_path.unlink()
-                        cleaned_count += 1
-                        logger.debug(f"已清理过期图像: {file_path.name}")
+        # 清理 images 目录
+        if images_dir.exists():
+            image_patterns = [
+                "gemini_image_*.*",
+                "gemini_advanced_image_*.*",
+                "help_*.png",
+            ]
+            for pattern in image_patterns:
+                for file_path in images_dir.glob(pattern):
+                    try:
+                        if datetime.fromtimestamp(file_path.stat().st_mtime) < cutoff_time:
+                            file_path.unlink()
+                            cleaned_count += 1
+                    except Exception as e:
+                        logger.warning(f"清理文件 {file_path} 时出错: {e}")
 
-                except Exception as e:
-                    logger.warning(f"清理文件 {file_path} 时出错: {e}")
+        # 清理 download_cache 目录
+        cache_dir = images_dir / "download_cache" if images_dir else plugin_data_dir / "images" / "download_cache"
+        if cache_dir.exists():
+            for file_path in cache_dir.glob("*"):
+                if file_path.is_file():
+                    try:
+                        if datetime.fromtimestamp(file_path.stat().st_mtime) < cutoff_time:
+                            file_path.unlink()
+                            cleaned_count += 1
+                    except Exception as e:
+                        logger.warning(f"清理缓存 {file_path} 时出错: {e}")
+
+        # 清理 split_output 目录
+        split_dir = plugin_data_dir / "split_output"
+        if split_dir.exists():
+            for file_path in split_dir.glob("*"):
+                if file_path.is_file():
+                    try:
+                        if datetime.fromtimestamp(file_path.stat().st_mtime) < cutoff_time:
+                            file_path.unlink()
+                            cleaned_count += 1
+                    except Exception as e:
+                        logger.warning(f"清理切图 {file_path} 时出错: {e}")
 
         if cleaned_count > 0:
-            logger.debug(f"共清理 {cleaned_count} 个过期图像文件")
+            logger.debug(f"共清理 {cleaned_count} 个过期文件")
 
     except Exception as e:
-        logger.error(f"图像清理过程出错: {e}")
+        logger.error(f"清理过程出错: {e}")
 
 
 async def download_qq_avatar(
@@ -720,7 +732,9 @@ async def normalize_image_input(
             return None, None
 
         cache_dir = image_cache_dir or IMAGE_CACHE_DIR
-        logger.debug(f"[REF_DEBUG] 规范化参考图输入: len={len(image_str)} type={type(image_input)} mode={image_input_mode}")
+        logger.debug(
+            f"[REF_DEBUG] 规范化参考图输入: len={len(image_str)} type={type(image_input)} mode={image_input_mode}"
+        )
 
         # data URI
         if image_str.startswith("data:image/") and ";base64," in image_str:
