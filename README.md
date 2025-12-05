@@ -1,8 +1,8 @@
-# AstrBot Gemini 图像生成插件 v1.6.4
+# AstrBot Gemini 图像生成插件 v1.6.5
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/Version-v1.6.4-blue)
+![Version](https://img.shields.io/badge/Version-v1.6.5-blue)
 ![License](https://img.shields.io/badge/License-MIT-orange)
 
 </div>
@@ -52,13 +52,37 @@
 
 ### 前置要求
 - AstrBot 4.5.0+
-- Python 3.8+
+- Python 3.10+
 - NapCat
 
-### 安装步骤
-1. 将插件文件夹放置到 `data/plugins/` 目录下
-2. 确保 `astrbot_plugin_gemini_image_generation` 文件夹存在
-3. 重启 AstrBot
+### 安装指南
+
+您可以通过以下两种方式安装 `Gemini 图像生成` 插件：
+
+---
+
+#### 方式一：通过 Git 克隆
+
+1.  **进入插件目录**
+    打开终端，并使用 `cd` 命令进入 `AstrBot/data/plugins/` 目录。
+
+2.  **克隆仓库**
+    在终端中执行以下命令，将插件仓库克隆到本地：
+    ```bash
+    git clone https://github.com/piexian/astrbot_plugin_gemini_image_generation
+---
+
+#### 方式二：通过插件市场
+
+1.  **打开插件市场**
+    在 AstrBot 的界面中，找到并进入插件市场。
+
+2.  **搜索插件**
+    在搜索框中输入 `Gemini 图像生成`。
+
+3.  **点击安装**
+    在搜索结果中找到该插件，并点击“安装”按钮。
+
 
 ## 🔧 配置
 
@@ -69,7 +93,6 @@
 - **api_settings.provider_id**: 生图模型提供商（`_special: select_provider`），自动读取模型/密钥/端点；不选将无法调用
 - **api_settings.vision_provider_id**: 视觉识别提供商（可选，用于切图前 AI 识别网格行列；留空则不调用）
 - **html_render_options.quality**: HTML 帮助页截图质量（1-100，可选）
-- **image_generation_settings.image_input_mode**: 参考图传输格式。`auto` 自动选择；`force_base64` 强制转为纯 base64（不接受 data URL/直链）；`prefer_url` 优先使用图片 URL，仅在必要时转换为 base64。
 - **参考图格式校验**: 参考图会在发送前统一检查 MIME，非 Gemini 支持的类型（PNG/JPEG/WEBP/HEIC/HEIF）将自动转为 PNG 再编码。
 
 ### 配置项详解
@@ -90,7 +113,6 @@
 - `max_reference_images`：参考图最大数量，默认 6。
 - `enable_text_response`：是否同时返回文本说明，默认 false。
 - `force_resolution`：强制传 `image_size` 参数给模型，默认 false。
-- `image_input_mode`：参考图传输格式，默认 `auto`（`force_base64` 纯 base64；`prefer_url` 仅白名单域名走 URL，其余转 base64）。
 
 **retry_settings**
 - `max_attempts_per_key`：每个密钥的最大重试次数，默认 3。
@@ -107,7 +129,11 @@
  - `single_config.template_name`：单一模板文件名，默认 `help_template_light`。
 
 **html_render_options**
-- `quality`：HTML 渲染截图质量（1-100，留空走默认）。
+- `quality`：截图质量（1-100，留空使用默认值，仅 jpeg 格式生效）。
+- `type`：截图格式，`png` 或 `jpeg`，默认 `png`。
+- `scale`：截图缩放方式，`device`（更清晰）或 `css`（更小更快），默认 `device`。
+- `full_page`：是否截取整页，默认 true。
+- `omit_background`：是否去除背景（仅 png 有效，可生成透明背景），默认 false。
 
 **limit_settings**
 - `group_limit_mode`：群限制模式 `none`/`whitelist`/`blacklist`，默认 none。
@@ -116,36 +142,9 @@
 - `rate_limit_period`：限流周期（秒），默认 60。
 - `max_requests_per_group`：单群周期内最大请求数，默认 5。
 
-### API 配置
-- **api_type**: `"google"`/`"openai"`（可选），若未填写则随 AstrBot 提供商自动识别
-- **model**: 可选覆盖提供商模型；留空则使用提供商默认模型
-
 ### 智能表情包切分
 - 切割优先级：手动网格 > AI 行列识别（需配置 vision_provider_id）> 智能网格 > 主体+附件吸附兜底
 - 未配置视觉提供商时直接进入智能网格；手动网格存在时不会调用 AI
-
-### 限制/限流设置
-
-#### 群限制模式
-- **group_limit_mode**: 群限制模式（none/whitelist/blacklist）
- - `none`: 不限制，所有群都可以使用
- - `whitelist`: 白名单模式，仅允许列表中的群使用
- - `blacklist`: 黑名单模式，禁止列表中的群使用
-- **group_limit_list**: 群号列表（字符串形式）
- - 根据群限制模式配置需要生效的群号
- - 在 none 模式下此配置不生效
-
-#### 群内限流
-- **enable_rate_limit**: 启用群内限流
- - 开启后对每个群在指定周期内的图像生成/改图请求次数进行限制
-- **rate_limit_period**: 限流周期（秒）
- - 每个群的统计周期长度，在此时间窗口内超过最大次数将被拒绝
- - 默认: 60秒
-- **max_requests_per_group**: 单群每周期最大请求数
- - 在一个周期内，每个群最多允许触发几次图像生成/改图/风格转换等请求
- - 默认: 5次
-
-**注意**: 群限制模式和群内限流可以同时启用，实现更精细的访问控制。
 
 ## 🎯 使用指南
 

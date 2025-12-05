@@ -9,6 +9,7 @@ import binascii
 import hashlib
 import io
 import os
+import re
 import struct
 import time
 import urllib.parse
@@ -147,14 +148,20 @@ async def save_base64_image(base64_data: str, image_format: str = "png") -> str 
 
         # 去掉空白并按块解码，避免一次性占用过大内存
         cleaned_data = "".join(base64_data.split())
-        chunk_size = 8192  # 必须是4的倍数
+        # 一次性解码完整数据，若失败则宽松清洗后再试
+        try:
+            raw = base64.b64decode(cleaned_data, validate=False)
+        except Exception:
+            import re
+
+            relaxed = re.sub(r"[^A-Za-z0-9+/=_-]", "", cleaned_data)
+            pad_len = (-len(relaxed)) % 4
+            if pad_len:
+                relaxed += "=" * pad_len
+            raw = base64.b64decode(relaxed, validate=False)
 
         with open(file_path, "wb") as f:
-            for i in range(0, len(cleaned_data), chunk_size):
-                chunk = cleaned_data[i : i + chunk_size]
-                if not chunk:
-                    continue
-                f.write(base64.b64decode(chunk))
+            f.write(raw)
 
         logger.debug(f"图像已保存: {file_path}")
         return str(file_path)
@@ -316,7 +323,11 @@ async def download_qq_avatar(
                 ("get_stranger_info", {"user_id": int(user_id), "no_cache": False})
             )
 
+            napcat_unsupported = False
+
             for action, payload in actions:
+                if napcat_unsupported:
+                    break
                 try:
                     resp = await bot.call_action(action, **payload)
                     url = None
@@ -330,7 +341,11 @@ async def download_qq_avatar(
                         logger.debug(f"通过 {action} 获取头像URL成功: {url}")
                         return url
                 except Exception as e:
-                    logger.debug(f"调用 {action} 获取头像失败: {e}")
+                    err_text = str(e)
+                    logger.debug(f"调用 {action} 获取头像失败: {err_text}")
+                    # 对于不支持的接口，避免继续尝试其他 NapCat API，直接走直链回退
+                    if getattr(e, "retcode", None) == 1404 or "不支持的Api" in err_text:
+                        napcat_unsupported = True
 
         logger.warning(f"无法通过事件系统获取用户 {user_id} 的头像URL")
         return None
@@ -369,7 +384,6 @@ async def download_qq_avatar(
                         avatar_url,
                         timeout=timeout,
                         headers=headers,
-                        trust_env=True,
                     ) as response:
                         if response.status != 200:
                             logger.error(
@@ -388,7 +402,11 @@ async def download_qq_avatar(
                             return None
 
                         # 尝试从响应头/URL 猜测 mime
-                        mime_type = (response.headers.get("Content-Type") or "").split(";")[0].lower()
+                        mime_type = (
+                            (response.headers.get("Content-Type") or "")
+                            .split(";")[0]
+                            .lower()
+                        )
                         if not mime_type or "/" not in mime_type:
                             suffix = (parsed.suffix or "").lower()
                             if suffix in {".png"}:
@@ -515,14 +533,41 @@ def is_valid_base64_image_str(value: str) -> bool:
     if not value:
         return False
 
-    if value.startswith("data:image/"):
-        return ";base64," in value
+    def _looks_like_image(raw: bytes) -> bool:
+        """通过魔数快速判断是否为常见图片格式"""
+        if not raw or len(raw) < 4:
+            return False
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return True
+        if raw.startswith(b"\xff\xd8"):  # JPEG
+            return True
+        if raw.startswith(b"RIFF") and len(raw) >= 12 and raw[8:12] == b"WEBP":
+            return True
+        if len(raw) >= 12 and raw[4:12] in {
+            b"ftypheic",
+            b"ftypheif",
+            b"ftypmif1",
+            b"ftypmsf1",
+            b"ftyphevc",
+        }:
+            return True
+        return False
 
+    cleaned = value.strip()
+    if not cleaned:
+        return False
+    # 明确包含 URL 特征时直接排除，避免误判
+    if "://" in cleaned:
+        return False
+
+    if cleaned.startswith("data:image/"):
+        _, _, cleaned = cleaned.partition(";base64,")
     try:
-        base64.b64decode(value, validate=True)
-        return True
+        raw = base64.b64decode(cleaned, validate=True)
     except Exception:
         return False
+
+    return _looks_like_image(raw)
 
 
 async def collect_image_sources(event, log_debug=logger.debug) -> list[str]:
@@ -653,7 +698,7 @@ async def normalize_image_input(
     image_input: any,
     *,
     image_cache_dir: Path | None = None,
-    image_input_mode: str = "auto",
+    image_input_mode: str = "force_base64",
 ) -> tuple[str | None, str | None]:
     """
     将参考图像输入规范化为 (mime_type, base64_data)。
@@ -664,17 +709,24 @@ async def normalize_image_input(
             return None, None
 
         image_str = str(image_input).strip()
+        # 若是 Markdown 图片语法，先提取括号里的 URL/data URI
+        md_match = re.search(r"!\[[^\]]*\]\(\s*([^)]+)\s*\)", image_str)
+        if md_match:
+            image_str = md_match.group(1).strip()
+
         if "&amp;" in image_str:
             image_str = image_str.replace("&amp;", "&")
         if not image_str:
             return None, None
 
         cache_dir = image_cache_dir or IMAGE_CACHE_DIR
+        logger.debug(f"[REF_DEBUG] 规范化参考图输入: len={len(image_str)} type={type(image_input)} mode={image_input_mode}")
 
         # data URI
         if image_str.startswith("data:image/") and ";base64," in image_str:
             header, data = image_str.split(";base64,", 1)
             mime_type = header.replace("data:", "")
+            logger.debug(f"[REF_DEBUG] 检测到 data URI，mime={mime_type}")
             try:
                 raw = base64.b64decode(data, validate=False)
             except Exception:
@@ -689,6 +741,7 @@ async def normalize_image_input(
             if image_path.exists() and image_path.is_file():
                 suffix = image_path.suffix.lower().lstrip(".") or "png"
                 mime_type = f"image/{suffix}"
+                logger.debug(f"[REF_DEBUG] 使用 file:// 路径: {image_path}")
                 try:
                     data_bytes = image_path.read_bytes()
                     return coerce_supported_image_bytes(mime_type, data_bytes)
@@ -701,6 +754,7 @@ async def normalize_image_input(
         if image_str.startswith("http://") or image_str.startswith("https://"):
             cleaned_url = image_str.replace("&amp;", "&")
             parsed_url = urllib.parse.urlparse(cleaned_url)
+            logger.debug(f"[REF_DEBUG] 下载 http(s) 参考图: {cleaned_url}")
 
             # 缓存命中直接读取，避免重复下载和内存占用
             try:
@@ -790,12 +844,21 @@ async def normalize_image_input(
 
                 logger.warning(f"参考图下载失败，原因: {fallback_reason}")
 
-        # 纯 base64（宽松校验）
+        # 纯 base64（宽松校验），尝试自动补齐/过滤非法字符
+        logger.debug("[REF_DEBUG] 尝试将输入视为纯 base64")
         try:
             base64.b64decode(image_str, validate=False)
             return coerce_supported_image(None, image_str)
         except binascii.Error:
-            return None, None
+            cleaned = re.sub(r"[^A-Za-z0-9+/=_-]", "", image_str)
+            pad_len = (-len(cleaned)) % 4
+            if pad_len:
+                cleaned += "=" * pad_len
+            try:
+                base64.b64decode(cleaned, validate=False)
+                return coerce_supported_image(None, cleaned)
+            except Exception:
+                return None, None
 
     except Exception as e:
         logger.error(f"规范化参考图输入失败: {e}")
@@ -805,9 +868,10 @@ async def normalize_image_input(
 async def resolve_image_source_to_path(
     source: str,
     *,
-    image_input_mode: str = "auto",
+    image_input_mode: str = "force_base64",
     api_client=None,
     download_qq_image_fn=None,
+    event=None,
     is_valid_checker=is_valid_base64_image_str,
     logger_obj=logger,
 ) -> str | None:
@@ -816,7 +880,7 @@ async def resolve_image_source_to_path(
 
     Args:
         source: 图片源（URL/文件/base64/data URL）
-        image_input_mode: 图片输入模式
+        image_input_mode: 参考图处理模式（统一 base64）
         api_client: 用于 normalize 的 API 客户端（可选）
         download_qq_image_fn: 处理 qpic 链接的下载函数（可选，需为 async）
         is_valid_checker: base64 校验函数
@@ -885,8 +949,13 @@ async def resolve_image_source_to_path(
                 logger_obj.debug(f"检查参考图缓存失败: {e}")
 
             data_url = None
-            if download_qq_image_fn and "qpic.cn" in parsed_host:
-                data_url = await download_qq_image_fn(src)
+            if download_qq_image_fn and (
+                "qpic.cn" in parsed_host or "nt.qq.com" in parsed_host
+            ):
+                try:
+                    data_url = await download_qq_image_fn(src, event=event)
+                except Exception:
+                    data_url = await download_qq_image_fn(src)
 
             if not data_url and api_client:
                 mime_type, b64 = await api_client._normalize_image_input(

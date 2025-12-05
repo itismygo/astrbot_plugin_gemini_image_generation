@@ -56,8 +56,10 @@ class StickerCutter:
         """去除白底，提取前景掩码"""
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         b, g, r = cv2.split(img)
-        white_mask = (r > self.white_threshold) & (g > self.white_threshold) & (
-            b > self.white_threshold
+        white_mask = (
+            (r > self.white_threshold)
+            & (g > self.white_threshold)
+            & (b > self.white_threshold)
         )
         fg_color = (~white_mask).astype(np.uint8) * 255
 
@@ -110,7 +112,11 @@ class StickerCutter:
                     split_width = cw // num_splits
                     for i in range(num_splits):
                         sx = x + i * split_width
-                        sw = split_width if i < num_splits - 1 else (cw - i * split_width)
+                        sw = (
+                            split_width
+                            if i < num_splits - 1
+                            else (cw - i * split_width)
+                        )
                         if sw > 50:
                             box = (sx, y, sx + sw, y + ch)
                             center = (sx + sw / 2, y + ch / 2)
@@ -121,7 +127,11 @@ class StickerCutter:
                     split_height = ch // num_splits
                     for i in range(num_splits):
                         sy = y + i * split_height
-                        sh = split_height if i < num_splits - 1 else (ch - i * split_height)
+                        sh = (
+                            split_height
+                            if i < num_splits - 1
+                            else (ch - i * split_height)
+                        )
                         if sh > 50:
                             box = (x, sy, x + cw, sy + sh)
                             center = (x + cw / 2, sy + sh / 2)
@@ -134,7 +144,9 @@ class StickerCutter:
 
         return regions
 
-    def _classify_regions(self, regions: list[Region]) -> tuple[list[Region], list[Region]]:
+    def _classify_regions(
+        self, regions: list[Region]
+    ) -> tuple[list[Region], list[Region]]:
         """区分主体与附件"""
         if not regions:
             return [], []
@@ -255,7 +267,9 @@ class StickerCutter:
 
         return [tuple(b) for b in main_boxes]
 
-    def _suppress_overlapping(self, boxes: list[Box], iou_threshold: float = 0.3) -> list[Box]:
+    def _suppress_overlapping(
+        self, boxes: list[Box], iou_threshold: float = 0.3
+    ) -> list[Box]:
         """简单非极大值抑制，去掉重叠过多的框"""
         if not boxes:
             return boxes
@@ -299,22 +313,28 @@ class StickerCutter:
                 kept.append(b)
         return kept
 
-    def _clean_edge_artifacts(self, crop: np.ndarray, edge_threshold: int = 3) -> np.ndarray:
+    def _clean_edge_artifacts(
+        self, crop: np.ndarray, edge_threshold: int = 3
+    ) -> np.ndarray:
         """清理裁剪边缘的贴边残留"""
         h, w = crop.shape[:2]
         if h < 20 or w < 20:
             return crop
 
         b, g, r = cv2.split(crop)
-        white_mask = (r > self.white_threshold) & (g > self.white_threshold) & (
-            b > self.white_threshold
+        white_mask = (
+            (r > self.white_threshold)
+            & (g > self.white_threshold)
+            & (b > self.white_threshold)
         )
         fg_mask = (~white_mask).astype(np.uint8) * 255
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         result = crop.copy()
         for cnt in contours:
             x, y, cw, ch = cv2.boundingRect(cnt)
@@ -344,9 +364,13 @@ class StickerCutter:
                 should_remove = True
             if touching_bottom and (y + ch) >= h - 1 and ch < h * height_threshold:
                 should_remove = True
-            if area_ratio < 0.03 and (touching_left or touching_right or touching_top or touching_bottom):
+            if area_ratio < 0.03 and (
+                touching_left or touching_right or touching_top or touching_bottom
+            ):
                 should_remove = True
-            corners = (touching_left or touching_right) and (touching_top or touching_bottom)
+            corners = (touching_left or touching_right) and (
+                touching_top or touching_bottom
+            )
             if corners and area_ratio < 0.05:
                 should_remove = True
 
@@ -373,13 +397,17 @@ class StickerCutter:
         edges = cv2.Canny(gray, 30, 100)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         edges_dilated = cv2.dilate(edges, kernel, iterations=2)
-        contours, _ = cv2.findContours(edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         fg_mask = np.zeros((h, w), dtype=np.uint8)
         cv2.drawContours(fg_mask, contours, -1, 255, -1)
 
         corner_colors = [img[0, 0], img[0, w - 1], img[h - 1, 0], img[h - 1, w - 1]]
         bg_color = np.mean(corner_colors, axis=0).astype(np.uint8)
-        color_diff = np.sqrt(np.sum((img.astype(float) - bg_color.astype(float)) ** 2, axis=2))
+        color_diff = np.sqrt(
+            np.sum((img.astype(float) - bg_color.astype(float)) ** 2, axis=2)
+        )
         bg_by_color = color_diff < 30
         fg_by_color = ~bg_by_color
 
