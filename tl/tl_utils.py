@@ -258,6 +258,19 @@ async def cleanup_old_images(images_dir: Path | None = None):
                 except Exception as e:
                     logger.warning(f"清理文件 {file_path} 时出错: {e}")
 
+        # 清理 ref_cache 目录（通过 get_file() 获取的参考图片缓存）
+        ref_cache_dir = images_dir / "ref_cache"
+        if ref_cache_dir.exists():
+            for file_path in ref_cache_dir.glob("ref_*"):
+                try:
+                    file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+                    if file_mtime < cutoff_time:
+                        file_path.unlink()
+                        cleaned_count += 1
+                        logger.debug(f"已清理过期参考图缓存: {file_path.name}")
+                except Exception as e:
+                    logger.warning(f"清理参考图缓存 {file_path} 时出错: {e}")
+
         if cleaned_count > 0:
             logger.debug(f"共清理 {cleaned_count} 个过期图像文件")
 

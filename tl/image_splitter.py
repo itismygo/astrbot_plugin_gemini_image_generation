@@ -866,7 +866,6 @@ def split_image(
     bboxes: list[dict[str, Any]] | None = None,
     manual_rows: int | None = None,
     manual_cols: int | None = None,
-    use_sticker_cutter: bool = False,
     ai_rows: int | None = None,
     ai_cols: int | None = None,
     use_black_line_cutter: bool = False,
@@ -997,40 +996,16 @@ def split_image(
         if not boxes and use_black_line_cutter:
             run_black_line_cutter(debug=True)
 
-        def run_sticker_cutter(debug: bool = True):
-            """执行主体+附件吸附分割"""
-            pass
-            # nonlocal sticker_crops, sticker_debug
-            # try:
-            #     from .sticker_cutter import StickerCutter
-
-            #     cutter = StickerCutter()
-            #     sticker_crops, sticker_debug = cutter.process_image(img, debug=debug)
-            #     if sticker_crops:
-            #         logger.debug(f"使用主体吸附分割，共 {len(sticker_crops)} 个裁剪结果")
-            # except Exception as e:
-            #     logger.debug(f"主体吸附分割失败: {e}")
-            #     sticker_crops = None
-
-        # 启用可选的主体+附件吸附分割算法
-        # if not boxes and use_sticker_cutter:
-        #     run_sticker_cutter(debug=True)
-
-        # 如果没有外部裁剪框或手动网格，则使用 SmartMemeSplitter 进行智能切分
+        # 如果没有外部裁剪框或手动网格，且没有黑线切割结果，则使用 SmartMemeSplitter 进行智能切分
         if not boxes and not sticker_crops:
             splitter = SmartMemeSplitter()
             boxes = splitter.detect_grid(img, debug=True)
-
-        # 智能切分仍失败时，自动使用主体吸附兜底
-        # if not boxes and not sticker_crops:
-        #     logger.debug("智能切分未检测到网格，尝试主体吸附分割兜底")
-        #     run_sticker_cutter(debug=False)
 
         if not boxes and not sticker_crops:
             logger.warning("智能切分未检测到网格")
             return []
 
-        # 直接保存主体吸附分割的结果
+        # 直接保存黑线分割的结果
         if sticker_crops:
             try:
                 for idx, crop in enumerate(sticker_crops, 1):
@@ -1043,7 +1018,7 @@ def split_image(
                     debug_file = final_output_dir / f"{base_name}_debug.png"
                     cv2.imwrite(str(debug_file), sticker_debug)
             except Exception as e:
-                logger.debug(f"保存主体吸附分割结果失败: {e}")
+                logger.debug(f"保存黑线分割结果失败: {e}")
                 output_files.clear()
         else:
             # 生成掩码预览（便于调试网格线）
