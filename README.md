@@ -52,13 +52,37 @@
 
 ### 前置要求
 - AstrBot 4.5.0+
-- Python 3.8+
+- Python 3.10+
 - NapCat
 
-### 安装步骤
-1. 将插件文件夹放置到 `data/plugins/` 目录下
-2. 确保 `astrbot_plugin_gemini_image_generation` 文件夹存在
-3. 重启 AstrBot
+### 安装指南
+
+您可以通过以下两种方式安装 `Gemini 图像生成` 插件：
+
+---
+
+#### 方式一：通过 Git 克隆
+
+1.  **进入插件目录**
+    打开终端，并使用 `cd` 命令进入 `AstrBot/data/plugins/` 目录。
+
+2.  **克隆仓库**
+    在终端中执行以下命令，将插件仓库克隆到本地：
+    ```bash
+    git clone https://github.com/piexian/astrbot_plugin_gemini_image_generation
+---
+
+#### 方式二：通过插件市场
+
+1.  **打开插件市场**
+    在 AstrBot 的界面中，找到并进入插件市场。
+
+2.  **搜索插件**
+    在搜索框中输入 `Gemini 图像生成`。
+
+3.  **点击安装**
+    在搜索结果中找到该插件，并点击“安装”按钮。
+
 
 ## 🔧 配置
 
