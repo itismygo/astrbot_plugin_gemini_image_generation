@@ -7,7 +7,11 @@ import numpy as np
 
 from astrbot.api import logger
 
-from .tl_utils import get_plugin_data_dir
+from .tl_utils import (
+    get_plugin_data_dir,
+    is_valid_base64_image_str,
+    resolve_image_source_to_path,
+)
 
 
 class LegacySmartMemeSplitter:
@@ -21,7 +25,9 @@ class LegacySmartMemeSplitter:
         self.last_row_lines: list[int] = []
         self.last_col_lines: list[int] = []
 
-    def detect_grid(self, image: np.ndarray, debug: bool = False) -> list[tuple[int, int, int, int]]:
+    def detect_grid(
+        self, image: np.ndarray, debug: bool = False
+    ) -> list[tuple[int, int, int, int]]:
         logger.warning("LegacySmartMemeSplitter 已弃用，请使用新版 SmartMemeSplitter")
         return []
 
@@ -93,7 +99,9 @@ class SmartMemeSplitter:
         cv2.line(canvas, (0, h), (w + plot_w, h), (0, 0, 0), 1)
         return canvas
 
-    def visualize_color_brightness_mutation_range(self, image: np.ndarray) -> np.ndarray:
+    def visualize_color_brightness_mutation_range(
+        self, image: np.ndarray
+    ) -> np.ndarray:
         """颜色/亮度突变范围图（调试用）"""
         h, w = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -127,15 +135,18 @@ class SmartMemeSplitter:
     def visualize_color_energy_map(self, image: np.ndarray) -> np.ndarray:
         """颜色能量图（调试用）"""
         h, w = image.shape[:2]
-        grad_r = cv2.Sobel(image[:, :, 0], cv2.CV_64F, 1, 0, ksize=3) ** 2 + cv2.Sobel(
-            image[:, :, 0], cv2.CV_64F, 0, 1, ksize=3
-        ) ** 2
-        grad_g = cv2.Sobel(image[:, :, 1], cv2.CV_64F, 1, 0, ksize=3) ** 2 + cv2.Sobel(
-            image[:, :, 1], cv2.CV_64F, 0, 1, ksize=3
-        ) ** 2
-        grad_b = cv2.Sobel(image[:, :, 2], cv2.CV_64F, 1, 0, ksize=3) ** 2 + cv2.Sobel(
-            image[:, :, 2], cv2.CV_64F, 0, 1, ksize=3
-        ) ** 2
+        grad_r = (
+            cv2.Sobel(image[:, :, 0], cv2.CV_64F, 1, 0, ksize=3) ** 2
+            + cv2.Sobel(image[:, :, 0], cv2.CV_64F, 0, 1, ksize=3) ** 2
+        )
+        grad_g = (
+            cv2.Sobel(image[:, :, 1], cv2.CV_64F, 1, 0, ksize=3) ** 2
+            + cv2.Sobel(image[:, :, 1], cv2.CV_64F, 0, 1, ksize=3) ** 2
+        )
+        grad_b = (
+            cv2.Sobel(image[:, :, 2], cv2.CV_64F, 1, 0, ksize=3) ** 2
+            + cv2.Sobel(image[:, :, 2], cv2.CV_64F, 0, 1, ksize=3) ** 2
+        )
         energy = np.sqrt(grad_r + grad_g + grad_b)
         energy = cv2.convertScaleAbs(energy)
 
@@ -240,7 +251,9 @@ class SmartMemeSplitter:
 
                 coverage = occupied / float(total_cells) if total_cells > 0 else 0.0
                 mean_dist = float(np.mean(dist_list)) if dist_list else 1.0
-                closed_ratio = closed_count / float(total_cells) if total_cells > 0 else 0.0
+                closed_ratio = (
+                    closed_count / float(total_cells) if total_cells > 0 else 0.0
+                )
                 score = coverage * 0.6 + (1.0 - mean_dist) * 0.3 + closed_ratio * 0.1
 
                 vis = image.copy()
@@ -250,7 +263,7 @@ class SmartMemeSplitter:
                 for c in range(1, cols):
                     cx_cut = int(round(c * cell_w))
                     cv2.line(vis, (cx_cut, 0), (cx_cut, h), (0, 200, 0), 1)
-                for (cx, cy) in centroids:
+                for cx, cy in centroids:
                     cv2.circle(vis, (int(cx), int(cy)), 4, (255, 0, 0), -1)
                 if centroids:
                     pts = np.array(centroids)
@@ -288,13 +301,18 @@ class SmartMemeSplitter:
         return int(np.sum(edge_map[:, pos]))
 
     def refine_grid_candidate(
-        self, candidate: dict, edge_map: np.ndarray | None = None, extend_pct: float = 0.05
+        self,
+        candidate: dict,
+        edge_map: np.ndarray | None = None,
+        extend_pct: float = 0.05,
     ) -> dict:
         """对单个候选网格做局部搜索微调"""
         if edge_map is None:
             vis_img = candidate.get("vis")
             edge_map = (
-                self.compute_color_edge_mutation(vis_img) if vis_img is not None else None
+                self.compute_color_edge_mutation(vis_img)
+                if vis_img is not None
+                else None
             )
             if edge_map is None:
                 raise ValueError("refine_grid_candidate requires an edge_map")
@@ -351,18 +369,32 @@ class SmartMemeSplitter:
             self._line_edge_sum(edge_map, "v", cc) for cc in refined_col_cuts[1:-1]
         ]
         total_edge_on_cuts = sum(row_edge_sums) + sum(col_edge_sums)
-        denom = float((len(refined_row_cuts) - 2) * w + (len(refined_col_cuts) - 2) * h + 1e-6)
+        denom = float(
+            (len(refined_row_cuts) - 2) * w + (len(refined_col_cuts) - 2) * h + 1e-6
+        )
         norm_penalty = float(total_edge_on_cuts) / denom
 
-        all_sums = np.array(row_edge_sums + col_edge_sums, dtype=float) if (row_edge_sums or col_edge_sums) else np.array([0.0])
+        all_sums = (
+            np.array(row_edge_sums + col_edge_sums, dtype=float)
+            if (row_edge_sums or col_edge_sums)
+            else np.array([0.0])
+        )
         mean_sum = float(np.mean(all_sums)) if all_sums.size else 0.0
         std_sum = float(np.std(all_sums)) if all_sums.size else 0.0
         rel_std = (std_sum / (mean_sum + 1e-6)) if mean_sum > 0 else 0.0
-        penetration_flag = bool(all_sums.size > 0 and mean_sum > 0 and np.any(all_sums > mean_sum * 1.5))
-        non_uniform_penalty = min(1.0, rel_std * 0.7 + (0.2 if penetration_flag else 0.0))
+        penetration_flag = bool(
+            all_sums.size > 0 and mean_sum > 0 and np.any(all_sums > mean_sum * 1.5)
+        )
+        non_uniform_penalty = min(
+            1.0, rel_std * 0.7 + (0.2 if penetration_flag else 0.0)
+        )
 
         base = candidate.get("score", 0.0)
-        refined_score = base * 0.55 + (1.0 - norm_penalty) * 0.25 + (1.0 - non_uniform_penalty) * 0.20
+        refined_score = (
+            base * 0.55
+            + (1.0 - norm_penalty) * 0.25
+            + (1.0 - non_uniform_penalty) * 0.20
+        )
 
         def fine_tune_cuts(r_cuts, c_cuts, edge_map):
             r_new = r_cuts.copy()
@@ -377,14 +409,18 @@ class SmartMemeSplitter:
                 orig = self._line_edge_sum(edge_map, "h", cur_y)
                 best_pos = cur_y
                 best_val = orig
-                for y in range(max(prev_y + 1, cur_y - delta), min(next_y - 1, cur_y + delta) + 1):
+                for y in range(
+                    max(prev_y + 1, cur_y - delta), min(next_y - 1, cur_y + delta) + 1
+                ):
                     v = self._line_edge_sum(edge_map, "h", y)
                     if v < best_val:
                         best_val = v
                         best_pos = y
                 improve = (orig - best_val) / (orig + 1e-9)
                 move = abs(best_pos - cur_y)
-                if best_pos != cur_y and (improve > 0.05 or (move > 0 and (improve / move) >= 0.02)):
+                if best_pos != cur_y and (
+                    improve > 0.05 or (move > 0 and (improve / move) >= 0.02)
+                ):
                     r_new[idx] = best_pos
 
             for idx in range(1, len(c_cuts) - 1):
@@ -396,14 +432,18 @@ class SmartMemeSplitter:
                 orig = self._line_edge_sum(edge_map, "v", cur_x)
                 best_pos = cur_x
                 best_val = orig
-                for x in range(max(prev_x + 1, cur_x - delta), min(next_x - 1, cur_x + delta) + 1):
+                for x in range(
+                    max(prev_x + 1, cur_x - delta), min(next_x - 1, cur_x + delta) + 1
+                ):
                     v = self._line_edge_sum(edge_map, "v", x)
                     if v < best_val:
                         best_val = v
                         best_pos = x
                 improve = (orig - best_val) / (orig + 1e-9)
                 move = abs(best_pos - cur_x)
-                if best_pos != cur_x and (improve > 0.05 or (move > 0 and (improve / move) >= 0.02)):
+                if best_pos != cur_x and (
+                    improve > 0.05 or (move > 0 and (improve / move) >= 0.02)
+                ):
                     c_new[idx] = best_pos
             return r_new, c_new
 
@@ -417,7 +457,9 @@ class SmartMemeSplitter:
             self._line_edge_sum(edge_map, "v", cc) for cc in tuned_col_cuts[1:-1]
         ]
         total_edge_on_cuts_tuned = sum(row_edge_sums_tuned) + sum(col_edge_sums_tuned)
-        denom_t = float((len(tuned_row_cuts) - 2) * w + (len(tuned_col_cuts) - 2) * h + 1e-6)
+        denom_t = float(
+            (len(tuned_row_cuts) - 2) * w + (len(tuned_col_cuts) - 2) * h + 1e-6
+        )
         norm_penalty_tuned = float(total_edge_on_cuts_tuned) / denom_t
 
         per_box_sums = []
@@ -494,23 +536,30 @@ class SmartMemeSplitter:
             valid_boxes.append((x, y, w, h))
         return valid_boxes
 
-    def detect_grid(self, image: np.ndarray, debug: bool = False) -> list[tuple[int, int, int, int]]:
+    def detect_grid(
+        self, image: np.ndarray, debug: bool = False
+    ) -> list[tuple[int, int, int, int]]:
         """主检测逻辑"""
         h, w = image.shape[:2]
 
         edge_map = self.compute_color_edge_mutation(image)
 
-        grid_candidates = self.analyze_grid_variations(image, edge_map=edge_map, max_grid=8)
+        grid_candidates = self.analyze_grid_variations(
+            image, edge_map=edge_map, max_grid=8
+        )
 
-        grad_r = cv2.Sobel(image[:, :, 0], cv2.CV_64F, 1, 0, ksize=3) ** 2 + cv2.Sobel(
-            image[:, :, 0], cv2.CV_64F, 0, 1, ksize=3
-        ) ** 2
-        grad_g = cv2.Sobel(image[:, :, 1], cv2.CV_64F, 1, 0, ksize=3) ** 2 + cv2.Sobel(
-            image[:, :, 1], cv2.CV_64F, 0, 1, ksize=3
-        ) ** 2
-        grad_b = cv2.Sobel(image[:, :, 2], cv2.CV_64F, 1, 0, ksize=3) ** 2 + cv2.Sobel(
-            image[:, :, 2], cv2.CV_64F, 0, 1, ksize=3
-        ) ** 2
+        grad_r = (
+            cv2.Sobel(image[:, :, 0], cv2.CV_64F, 1, 0, ksize=3) ** 2
+            + cv2.Sobel(image[:, :, 0], cv2.CV_64F, 0, 1, ksize=3) ** 2
+        )
+        grad_g = (
+            cv2.Sobel(image[:, :, 1], cv2.CV_64F, 1, 0, ksize=3) ** 2
+            + cv2.Sobel(image[:, :, 1], cv2.CV_64F, 0, 1, ksize=3) ** 2
+        )
+        grad_b = (
+            cv2.Sobel(image[:, :, 2], cv2.CV_64F, 1, 0, ksize=3) ** 2
+            + cv2.Sobel(image[:, :, 2], cv2.CV_64F, 0, 1, ksize=3) ** 2
+        )
         energy = np.sqrt(grad_r + grad_g + grad_b)
         energy = cv2.convertScaleAbs(energy)
 
@@ -530,7 +579,9 @@ class SmartMemeSplitter:
                 y = row_cuts[i]
                 final_boxes.append((x, y, col_cuts[j + 1] - x, row_cuts[i + 1] - y))
 
-        refined_top3 = self.select_and_refine_top(grid_candidates, edge_map=edge_map, top_n=3)
+        refined_top3 = self.select_and_refine_top(
+            grid_candidates, edge_map=edge_map, top_n=3
+        )
 
         if refined_top3:
             best_ref = refined_top3[0]
@@ -585,7 +636,11 @@ class AIMemeSplitter:
         return 255 - new_mask
 
     def _optimize_grid_positions(
-        self, initial_cuts: list[int], proj_values: np.ndarray, length: int, axis_name: str
+        self,
+        initial_cuts: list[int],
+        proj_values: np.ndarray,
+        length: int,
+        axis_name: str,
     ) -> list[int]:
         """在保证均匀性的前提下微调切割线，避开内容"""
         if len(initial_cuts) <= 2:
@@ -614,22 +669,35 @@ class AIMemeSplitter:
                 mean_interval = np.mean(intervals)
                 std_interval = np.std(intervals)
                 uniformity_score = (
-                    1.0 / (1.0 + std_interval / mean_interval) if mean_interval > 0 else 0
+                    1.0 / (1.0 + std_interval / mean_interval)
+                    if mean_interval > 0
+                    else 0
                 )
-                distance_penalty = 1.0 / (1.0 + abs(test_pos - ideal_pos) / search_radius)
-                total_score = 0.6 * uniformity_score + 0.3 * gap_score + 0.1 * distance_penalty
+                distance_penalty = 1.0 / (
+                    1.0 + abs(test_pos - ideal_pos) / search_radius
+                )
+                total_score = (
+                    0.6 * uniformity_score + 0.3 * gap_score + 0.1 * distance_penalty
+                )
                 if total_score > best_score:
                     best_score = total_score
                     best_pos = test_pos
 
             optimized_cuts.append(best_pos)
-            logger.debug(f"[{axis_name}] 位置{i}: {current_pos} -> {best_pos} (偏移{best_pos - current_pos})")
+            logger.debug(
+                f"[{axis_name}] 位置{i}: {current_pos} -> {best_pos} (偏移{best_pos - current_pos})"
+            )
 
         optimized_cuts.append(initial_cuts[-1])
         return optimized_cuts
 
     def _solve_axis(
-        self, gap_proj: np.ndarray, struct_proj: np.ndarray, length: int, axis_name: str, manual_n: int
+        self,
+        gap_proj: np.ndarray,
+        struct_proj: np.ndarray,
+        length: int,
+        axis_name: str,
+        manual_n: int,
     ) -> list[int]:
         """根据目标行/列数求切割线"""
         max_gap = np.max(gap_proj)
@@ -714,24 +782,39 @@ class AIMemeSplitter:
             max_disp = step * 0.3
             score_displacement = max(0, 1.0 - (avg_disp / max_disp))
             final_score = (
-                0.5 * score_uniformity + 0.3 * score_safety + 0.2 * score_displacement + n * 0.05
+                0.5 * score_uniformity
+                + 0.3 * score_safety
+                + 0.2 * score_displacement
+                + n * 0.05
             )
             if final_score > best_score:
                 best_score = final_score
                 best_cuts = cuts
 
         if len(best_cuts) > 2:
-            optimized_cuts = self._optimize_grid_positions(best_cuts, norm_gap, length, axis_name)
+            optimized_cuts = self._optimize_grid_positions(
+                best_cuts, norm_gap, length, axis_name
+            )
             old_intervals = np.diff(best_cuts)
             new_intervals = np.diff(optimized_cuts)
-            old_cv = np.std(old_intervals) / np.mean(old_intervals) if np.mean(old_intervals) > 0 else float("inf")
-            new_cv = np.std(new_intervals) / np.mean(new_intervals) if np.mean(new_intervals) > 0 else float("inf")
+            old_cv = (
+                np.std(old_intervals) / np.mean(old_intervals)
+                if np.mean(old_intervals) > 0
+                else float("inf")
+            )
+            new_cv = (
+                np.std(new_intervals) / np.mean(new_intervals)
+                if np.mean(new_intervals) > 0
+                else float("inf")
+            )
             if new_cv <= old_cv * 1.1:
                 best_cuts = optimized_cuts
 
         return best_cuts
 
-    def detect_grid(self, lineart: np.ndarray, target_rows: int, target_cols: int) -> tuple[list[int], list[int]]:
+    def detect_grid(
+        self, lineart: np.ndarray, target_rows: int, target_cols: int
+    ) -> tuple[list[int], list[int]]:
         """基于目标行列检测网格线"""
         h, w = lineart.shape
         edges = 255 - lineart
@@ -751,8 +834,12 @@ class AIMemeSplitter:
         v_struct_proj = np.sum(v_struct, axis=0)
 
         kernel_size = 3
-        row_proj = np.convolve(np.sum(edges, axis=1), np.ones(kernel_size) / kernel_size, mode="same")
-        col_proj = np.convolve(np.sum(edges, axis=0), np.ones(kernel_size) / kernel_size, mode="same")
+        row_proj = np.convolve(
+            np.sum(edges, axis=1), np.ones(kernel_size) / kernel_size, mode="same"
+        )
+        col_proj = np.convolve(
+            np.sum(edges, axis=0), np.ones(kernel_size) / kernel_size, mode="same"
+        )
 
         h_lines = self._solve_axis(row_proj, h_struct_proj, h, "水平", target_rows)
         v_lines = self._solve_axis(col_proj, v_struct_proj, w, "垂直", target_cols)
@@ -856,6 +943,34 @@ def ai_split_with_rows_cols(
     except Exception as e:
         logger.debug(f"AI 行列切分失败: {e}")
         return []
+
+
+async def resolve_split_source_to_path(
+    source: str,
+    *,
+    image_input_mode: str = "force_base64",
+    api_client=None,
+    download_qq_image_fn=None,
+    logger_obj=logger,
+) -> str | None:
+    """
+    将切图指令收到的图片源统一解析为本地文件路径，内部复用 tl_utils 逻辑。
+
+    Args:
+        source: 图片源（URL/文件/base64/data URL）
+        image_input_mode: 图片输入模式，统一转为 base64
+        api_client: 用于 normalize 的 API 客户端
+        download_qq_image_fn: 处理 qpic 等直链的下载函数
+        logger_obj: 日志对象
+    """
+    return await resolve_image_source_to_path(
+        source,
+        image_input_mode=image_input_mode,
+        api_client=api_client,
+        download_qq_image_fn=download_qq_image_fn,
+        is_valid_checker=is_valid_base64_image_str,
+        logger_obj=logger_obj,
+    )
 
 
 def split_image(
@@ -985,7 +1100,9 @@ def split_image(
                 cutter = StickerCutter()
                 sticker_crops, sticker_debug = cutter.process_image(img, debug=debug)
                 if sticker_crops:
-                    logger.debug(f"使用主体吸附分割，共 {len(sticker_crops)} 个裁剪结果")
+                    logger.debug(
+                        f"使用主体吸附分割，共 {len(sticker_crops)} 个裁剪结果"
+                    )
             except Exception as e:
                 logger.debug(f"主体吸附分割失败: {e}")
                 sticker_crops = None

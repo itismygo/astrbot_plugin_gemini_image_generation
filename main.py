@@ -27,14 +27,15 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import ProviderType
 
-from .tl import create_zip, split_image
+from .tl import create_zip, resolve_split_source_to_path, split_image
 from .tl.enhanced_prompts import (
+    build_quick_prompt,
     enhance_prompt_for_figure,
-    get_auto_modification_prompt,
     get_avatar_prompt,
     get_card_prompt,
     get_figure_prompt,
     get_generation_prompt,
+    get_grid_detect_prompt,
     get_mobile_prompt,
     get_modification_prompt,
     get_poster_prompt,
@@ -54,7 +55,11 @@ from .tl.tl_utils import (
     AvatarManager,
     cleanup_old_images,
     download_qq_avatar,
+    encode_file_to_base64,
     send_file,
+)
+from .tl.tl_utils import (
+    is_valid_base64_image_str as util_is_valid_base64_image_str,
 )
 
 
@@ -307,7 +312,7 @@ class GeminiImageGenerationPlugin(Star):
         self.api_keys: list[str] = []
 
         # 尝试从 AstrBot 提供商读取动态配置（可能在启动初期尚未就绪）
-        self._load_provider_from_context()
+        self._load_provider_from_context(quiet=True)
 
         image_settings = self.config.get("image_generation_settings", {})
         self.resolution = image_settings.get("resolution", "1K")
@@ -323,13 +328,8 @@ class GeminiImageGenerationPlugin(Star):
         self.enable_llm_crop = image_settings.get("enable_llm_crop", True)
         # 从配置中读取强制分辨率设置，默认为False
         self.force_resolution = image_settings.get("force_resolution", False)
-        raw_image_mode = str(image_settings.get("image_input_mode", "auto")).lower()
-        if raw_image_mode not in {"auto", "force_base64", "prefer_url"}:
-            logger.warning(
-                f"未知的图片输入模式: {raw_image_mode}，已回退为 auto（自动选择格式）"
-            )
-            raw_image_mode = "auto"
-        self.image_input_mode = raw_image_mode
+        # 参考图传输统一使用 base64，移除格式可选项
+        self.image_input_mode = "force_base64"
 
         retry_settings = self.config.get("retry_settings", {})
         self.max_attempts_per_key = retry_settings.get("max_attempts_per_key", 3)
@@ -525,20 +525,18 @@ class GeminiImageGenerationPlugin(Star):
         """输出debug级别日志"""
         logger.debug(message)
 
+    async def _safe_send(self, event: AstrMessageEvent, payload):
+        """包装发送，若平台发送失败则提示用户"""
+        try:
+            yield payload
+        except Exception as e:
+            logger.error(f"发送消息失败: {e}")
+            yield event.plain_result("⚠️ 消息发送失败，请稍后重试或检查网络/权限。")
+
     @staticmethod
     def _is_valid_base64_image_str(value: str) -> bool:
-        """粗略判断字符串是否为有效的 base64 图像数据或 data URL"""
-        if not value:
-            return False
-
-        if value.startswith("data:image/"):
-            return ";base64," in value
-
-        try:
-            base64.b64decode(value, validate=True)
-            return True
-        except Exception:
-            return False
+        """委托统一的工具方法判断 base64 图像有效性"""
+        return util_is_valid_base64_image_str(value)
 
     @staticmethod
     def _clean_text_content(text: str) -> str:
@@ -586,11 +584,6 @@ class GeminiImageGenerationPlugin(Star):
         """
         过滤出合法的参考图像。
 
-        根据 image_input_mode：
-        - auto / prefer_url 支持 http(s) URL 和 base64/data URL
-        - force_base64 仅允许纯 base64（不接受 data URL）
-
-
         NapCat 等平台的图片 file_id（例如 D127D0...jpg）会在这里被过滤掉，
         避免传给 Gemini 导致 Base64 解码错误。
         """
@@ -598,28 +591,26 @@ class GeminiImageGenerationPlugin(Star):
             return []
 
         valid: list[str] = []
-        allow_url = self.image_input_mode in {"auto", "prefer_url"}
-        force_b64 = self.image_input_mode == "force_base64"
         for img in images:
             if not isinstance(img, str) or not img:
                 self.log_debug(f"跳过非字符串参考图像({source}): {type(img)}")
                 continue
 
             cleaned = img.strip()
-            if force_b64 and cleaned.lower().startswith("data:"):
-                self.log_debug(
-                    f"跳过 data URL（force_base64 模式）({source}): {cleaned[:64]}..."
-                )
+            if cleaned.lower().startswith("http://") or cleaned.lower().startswith(
+                "https://"
+            ):
+                self.log_debug(f"跳过 URL 参考图像({source}): {cleaned[:64]}...")
                 continue
 
             if self._is_valid_base64_image_str(cleaned):
                 valid.append(cleaned)
-            elif allow_url and (
-                cleaned.startswith("http://") or cleaned.startswith("https://")
-            ):
+            elif cleaned.lower().startswith("data:image/") and ";base64," in cleaned:
                 valid.append(cleaned)
             else:
-                self.log_debug(f"跳过非支持格式参考图像({source}): {cleaned[:64]}...")
+                self.log_debug(
+                    f"跳过非支持格式参考图像({source}): {cleaned[:64]}..."
+                )
 
         return valid
 
@@ -647,16 +638,24 @@ class GeminiImageGenerationPlugin(Star):
         group_id = self._get_group_id_from_event(event)
 
         if not group_id:
+            logger.debug("[FLOW_DEBUG][rate_limit] 无 group_id，跳过限流")
             return True, None
 
         if self.group_limit_mode == "whitelist":
             if self.group_limit_list and group_id not in self.group_limit_list:
+                logger.debug(
+                    "[FLOW_DEBUG][rate_limit] 拒绝（不在白名单） group_id=%s", group_id
+                )
                 return False, None
         elif self.group_limit_mode == "blacklist":
             if self.group_limit_list and group_id in self.group_limit_list:
+                logger.debug(
+                    "[FLOW_DEBUG][rate_limit] 拒绝（在黑名单） group_id=%s", group_id
+                )
                 return False, None
 
         if not self.enable_rate_limit:
+            logger.debug("[FLOW_DEBUG][rate_limit] 未启用限流 group_id=%s", group_id)
             return True, None
 
         now = time.monotonic()
@@ -673,6 +672,13 @@ class GeminiImageGenerationPlugin(Star):
                     retry_after = 0
 
                 self._rate_limit_buckets[group_id] = bucket
+                logger.debug(
+                    "[FLOW_DEBUG][rate_limit] 触发限流 group_id=%s count=%s/%s retry_after=%s",
+                    group_id,
+                    len(bucket),
+                    self.max_requests_per_group,
+                    retry_after,
+                )
                 return (
                     False,
                     f"⏱️ 本群在最近 {self.rate_limit_period} 秒内的生图请求次数已达上限（{self.max_requests_per_group} 次），请约 {retry_after} 秒后再试。",
@@ -681,22 +687,40 @@ class GeminiImageGenerationPlugin(Star):
             bucket.append(now)
             self._rate_limit_buckets[group_id] = bucket
 
+        logger.debug(
+            "[FLOW_DEBUG][rate_limit] 通过 group_id=%s 当前计数=%s",
+            group_id,
+            len(self._rate_limit_buckets.get(group_id, [])),
+        )
         return True, None
 
     async def initialize(self):
         """插件初始化"""
-        # 启动阶段如果 provider_manager 还未就绪，这里再尝试读取一次
-        if not self.api_client:
-            self._load_provider_from_context()
+        # 启动早期 provider_manager 可能尚未就绪，优先等待 on_astrbot_loaded 再初始化
+        if self.api_client:
+            logger.debug("[FLOW_DEBUG] initialize 已有 api_client，跳过")
+            return
 
+        provider_mgr = getattr(self.context, "provider_manager", None)
+        ready = False
+        if provider_mgr:
+            inst_map = getattr(provider_mgr, "inst_map", {}) or {}
+            ready = bool(inst_map)
+        if not ready:
+            logger.debug("启动阶段未检测到可用提供商，等待 AstrBot 完成加载后再初始化")
+            return
+
+        logger.debug("[FLOW_DEBUG] initialize 尝试加载提供商配置")
+        self._load_provider_from_context(quiet=True)
         if self.api_client:
             logger.info("🎨 Gemini 图像生成插件已加载")
         else:
-            logger.error("✗ API 客户端初始化失败，请检查配置")
+            logger.debug("启动阶段未能初始化 API 客户端，待 on_astrbot_loaded 再补偿")
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
         """AstrBot 完成初始化后再次尝试加载提供商，解决启动顺序导致的配置未读问题"""
+        logger.debug("[FLOW_DEBUG] on_astrbot_loaded 触发，尝试确保 api_client")
         if not self.api_client:
             self._load_provider_from_context()
             if self.api_client:
@@ -709,15 +733,18 @@ class GeminiImageGenerationPlugin(Star):
     def _ensure_api_client(self) -> bool:
         """确保 API 客户端已初始化，启动初期 provider_mgr 可能尚未就绪"""
         if self.api_client:
+            logger.debug("[FLOW_DEBUG] api_client 已就绪")
             return True
-        self._load_provider_from_context()
+        self._load_provider_from_context(quiet=True)
         if not self.api_client:
             logger.error("✗ API 客户端仍未初始化，请检查 AstrBot 提供商配置")
             return False
         return True
 
-    def _load_provider_from_context(self):
+    def _load_provider_from_context(self, *, quiet: bool = False):
         """从 AstrBot 提供商读取模型/密钥并初始化客户端，可多次调用用于补偿启动时机"""
+        if not quiet:
+            logger.debug("[FLOW_DEBUG] 尝试读取 AstrBot 提供商配置")
         api_settings = self.config.get("api_settings", {})
         provider_id = api_settings.get("provider_id") or self.provider_id
         manual_api_type = (api_settings.get("api_type") or "").strip()
@@ -780,9 +807,10 @@ class GeminiImageGenerationPlugin(Star):
                     f"✓ 已从 AstrBot 提供商读取配置，类型={self.api_type} 模型={self.model} 密钥={len(self.api_keys)}"
                 )
             else:
-                logger.error(
-                    "未找到可用的 AstrBot 提供商，无法读取模型/密钥，请在主配置中选择提供商"
-                )
+                if not quiet:
+                    logger.error(
+                        "未找到可用的 AstrBot 提供商，无法读取模型/密钥，请在主配置中选择提供商"
+                    )
         except Exception as e:
             logger.error(f"读取 AstrBot 提供商配置失败: {e}")
 
@@ -795,12 +823,83 @@ class GeminiImageGenerationPlugin(Star):
             if self.api_base:
                 logger.info(f"  - 自定义 API Base: {self.api_base}")
         else:
-            logger.error("✗ 未读取到 API 密钥，请确认 AstrBot 提供商中已配置 key")
+            if not quiet:
+                # 启动阶段可能尚未加载 provider，不再输出 error，交由 on_astrbot_loaded 补偿
+                logger.debug("启动阶段未读取到 API 密钥，等待 AstrBot 加载完成后再尝试")
 
-    async def _download_qq_image(self, url: str) -> str | None:
-        """对QQ图床做特殊处理，补充Referer/UA后转为base64"""
+    async def _download_qq_image(self, url: str, event: AstrMessageEvent | None = None) -> str | None:
+        """对QQ图床/nt.qq.com做特殊处理，优先通过适配器取二进制，失败再走HTTP"""
         try:
             parsed = urllib.parse.urlparse(url)
+
+            # 优先使用适配器API拉取原始图片，避免直链失效
+            try:
+                async def _call_get_image(client, **kwargs):
+                    # 兼容 client.api.call_action 和 client.call_action 两种写法
+                    if hasattr(client, "api") and hasattr(client.api, "call_action"):
+                        return await client.api.call_action("get_image", **kwargs)
+                    if hasattr(client, "call_action"):
+                        return await client.call_action("get_image", **kwargs)
+                    return None
+
+                bot_client = getattr(event, "bot", None) if event else None
+
+                if bot_client:
+                    # 先尝试完整URL
+                    resp = await _call_get_image(bot_client, file=url)
+                    if isinstance(resp, dict):
+                        if resp.get("base64"):
+                            return resp["base64"]
+                        if resp.get("url"):
+                            return resp["url"]
+                        if resp.get("file") and Path(resp["file"]).exists():
+                            mime_guess = (
+                                f"image/{Path(resp['file']).suffix.lstrip('.') or 'png'}"
+                            )
+                            data = encode_file_to_base64(resp["file"])
+                            return f"data:{mime_guess};base64,{data}"
+
+                    file_id = None
+                    qs = urllib.parse.parse_qs(parsed.query or "")
+                    if "fileid" in qs and qs["fileid"]:
+                        file_id = qs["fileid"][0]
+                    if not file_id:
+                        file_id = parsed.path.rsplit("/", 1)[-1]
+
+                    if file_id:
+                        resp = await _call_get_image(
+                            bot_client, file_id=file_id, file=file_id
+                        )
+                        if isinstance(resp, dict):
+                            if resp.get("base64"):
+                                return resp["base64"]
+                            if resp.get("url"):
+                                return resp["url"]
+                            if resp.get("file") and Path(resp["file"]).exists():
+                                mime_guess = (
+                                    f"image/{Path(resp['file']).suffix.lstrip('.') or 'png'}"
+                                )
+                                data = encode_file_to_base64(resp["file"])
+                                return f"data:{mime_guess};base64,{data}"
+
+                # 再尝试通过 context 拿到平台实例调用
+                if not bot_client and event:
+                    try:
+                        from astrbot.api.platform import PlatformAdapterType
+
+                        platform = self.context.get_platform(
+                            PlatformAdapterType.AIOCQHTTP
+                        )
+                        client = getattr(platform, "get_client", lambda: None)()
+                        if client:
+                            resp = await _call_get_image(client, file=url)
+                            if isinstance(resp, dict) and resp.get("base64"):
+                                return resp["base64"]
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"适配器获取 nt.qq/qpic 图片失败，回退HTTP: {e}")
+
             headers = {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -813,26 +912,40 @@ class GeminiImageGenerationPlugin(Star):
                 headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
             if "qpic.cn" in (parsed.netloc or ""):
                 headers["Referer"] = "https://qun.qq.com"
+            if "nt.qq.com" in (parsed.netloc or ""):
+                headers["Referer"] = "https://qun.qq.com"
+                headers["Origin"] = "https://qun.qq.com"
 
             timeout = aiohttp.ClientTimeout(total=12, connect=5)
-            async with aiohttp.ClientSession(
-                headers=headers, trust_env=True
-            ) as session:
-                async with session.get(url, timeout=timeout) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            f"QQ图片下载失败: HTTP {resp.status} {resp.reason} | {url[:80]}"
-                        )
-                        return None
-                    data = await resp.read()
-                    if not data:
-                        logger.warning(f"QQ图片为空: {url[:80]}")
-                        return None
-                    mime = resp.headers.get("Content-Type", "image/jpeg")
-                    if ";" in mime:
-                        mime = mime.split(";", 1)[0]
-                    base64_data = base64.b64encode(data).decode("utf-8")
-                    return f"data:{mime};base64,{base64_data}"
+            async def _http_fetch(target_url: str) -> str | None:
+                try:
+                    async with aiohttp.ClientSession(
+                        headers=headers, trust_env=True
+                    ) as session:
+                        async with session.get(target_url, timeout=timeout) as resp:
+                            if resp.status != 200:
+                                logger.warning(
+                                    f"QQ图片下载失败: HTTP {resp.status} {resp.reason} | {target_url[:80]}"
+                                )
+                                return None
+                            data = await resp.read()
+                            if not data:
+                                logger.warning(f"QQ图片为空: {target_url[:80]}")
+                                return None
+                            mime = resp.headers.get("Content-Type", "image/jpeg")
+                            if ";" in mime:
+                                mime = mime.split(";", 1)[0]
+                            base64_data = base64.b64encode(data).decode("utf-8")
+                            return f"data:{mime};base64,{base64_data}"
+                except Exception as e:
+                    logger.warning(f"QQ图片下载异常: {e} | {target_url[:80]}")
+                    return None
+
+            # 先 https，失败再试 http
+            data_url = await _http_fetch(url)
+            if not data_url and url.startswith("https://"):
+                data_url = await _http_fetch("http://" + url[len("https://") :])
+            return data_url
         except Exception as e:
             logger.warning(f"QQ图片下载异常: {e} | {url[:80]}")
             return None
@@ -850,7 +963,7 @@ class GeminiImageGenerationPlugin(Star):
         seen_sources: set[str] = set()
         seen_users: set[str] = set()
         conversion_cache: dict[str, str] = {}
-        image_mode = self.image_input_mode
+        image_mode = self.image_input_mode  # 统一为 force_base64
         max_images = self.max_reference_images
 
         if not hasattr(event, "message_obj") or not event.message_obj:
@@ -892,9 +1005,7 @@ class GeminiImageGenerationPlugin(Star):
 
         async def convert_image_source(img_source: str, origin: str) -> str | None:
             """
-            按 image_input_mode 转换图片源：
-            - force_base64：全部转为纯 base64
-            - auto/prefer_url：优先使用 http(s) 链接，必要时转 base64
+            统一转换图片源为 base64（不再透传 URL）
             """
             if not img_source:
                 return None
@@ -911,7 +1022,7 @@ class GeminiImageGenerationPlugin(Star):
             except Exception:
                 parsed_host = ""
 
-            force_b64 = image_mode == "force_base64"
+            force_b64 = True
 
             def _extract_base64_only(val: str) -> str | None:
                 """提取纯 base64 数据，剥离 data URL 前缀"""
@@ -965,9 +1076,9 @@ class GeminiImageGenerationPlugin(Star):
                     )
                 return None
 
-            # QQ 图床优先转 base64，避免直链失效
-            if parsed_host and "qpic.cn" in parsed_host:
-                qq_data = await self._download_qq_image(source_str)
+            # QQ 图床优先转 base64，避免直链失效（含 nt.qq.com）
+            if parsed_host and ("qpic.cn" in parsed_host or "nt.qq.com" in parsed_host):
+                qq_data = await self._download_qq_image(source_str, event=event)
                 if qq_data:
                     if force_b64 and ";base64," in qq_data:
                         qq_data = qq_data.split(";base64,", 1)[1]
@@ -983,22 +1094,14 @@ class GeminiImageGenerationPlugin(Star):
                 conversion_cache[img_source] = source_str
                 return source_str
 
-            # 强制 base64 模式
-            if image_mode == "force_base64":
-                return await to_data_url(source_str)
-
-            # auto / prefer_url：对 http(s) 链接保留 URL，其他情况转 base64
-            if source_str.startswith("http://") or source_str.startswith("https://"):
-                cleaned_url = source_str.replace("&amp;", "&")
-                conversion_cache[img_source] = cleaned_url
-                return cleaned_url
-
+            # 统一转 base64，所有参考图不再直接透传 URL
             return await to_data_url(source_str)
 
         async def handle_image_component(component, origin: str):
             if len(message_images) >= max_images:
                 return
 
+            force_b64 = image_mode == "force_base64"
             img_source = None
             if isinstance(component, Image):
                 if getattr(component, "url", None):
@@ -1019,6 +1122,31 @@ class GeminiImageGenerationPlugin(Star):
                 return
 
             seen_sources.add(img_source)
+
+            # 优先使用组件自带的 base64 转换能力，避免依赖直链截断
+            if hasattr(component, "convert_to_base64"):
+                try:
+                    raw_b64 = await component.convert_to_base64()
+                    if raw_b64:
+                        ref_val = (
+                            raw_b64
+                            if force_b64
+                            else f"data:image/jpeg;base64,{raw_b64}"
+                        )
+                        check_val = raw_b64 if force_b64 else ref_val
+                        if self._is_valid_base64_image_str(check_val):
+                            conversion_cache[img_source] = ref_val
+                            message_images.append(ref_val)
+                            self.log_debug(
+                                f"✓ 直接从消息组件转换图片 (当前: {len(message_images)}/{max_images})"
+                            )
+                            return
+                        self.log_debug(
+                            f"组件转换结果未通过校验，尝试通用流程({origin})"
+                        )
+                except Exception as e:
+                    logger.debug(f"组件 convert_to_base64 异常，回退通用流程: {e}")
+
             ref_img = await convert_image_source(str(img_source), origin)
             if ref_img:
                 message_images.append(ref_img)
@@ -1278,6 +1406,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 f"（状态码 {e.status_code}）" if e.status_code is not None else ""
             )
             error_msg = f"❌ 图像生成失败{status_part}：{e.message}"
+            message_lower = (e.message or "").lower()
+            api_base_lower = (self.api_base or "").lower()
             if e.status_code == 429:
                 error_msg += "\n🧐 可能原因：请求过于频繁或额度已用完。\n✅ 建议：稍等片刻再试，或在配置中增加可用额度/开启智能重试。"
             elif e.status_code == 402:
@@ -1286,6 +1416,12 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 error_msg += "\n🧐 可能原因：API 密钥无效、权限不足或访问受限。\n✅ 建议：核对密钥权限、检查 IP 白名单，必要时重新生成密钥。"
             elif e.status_code and 500 <= e.status_code < 600:
                 error_msg += "\n🧐 可能原因：上游服务暂时不可用。\n✅ 建议：稍后重试，若频繁出现请联系服务提供方确认故障。"
+                # t2i 公共服务繁忙提示
+                if ("t2i" in message_lower) or ("t2i" in api_base_lower):
+                    error_msg += (
+                        "\n⚠️ t2i 公共服务器当前可能繁忙，建议稍后再试；"
+                        "如需稳定产能可参考 https://docs.astrbot.app/others/self-host-t2i.html 自建。"
+                    )
             else:
                 error_msg += "\n🧐 可能原因：请求参数异常或服务返回未知错误。\n✅ 建议：简化提示词/减少参考图后重试，并查看日志获取更多细节。"
             logger.error(error_msg)
@@ -1334,12 +1470,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             logger.debug(f"[GRID_DETECT] 读取/压缩图片失败，使用原图: {e}")
             vision_input_path = image_path
 
-        prompt = (
-            "Analyze the image and count the grid of stickers/emojis. "
-            'Respond ONLY in JSON like {"rows":4,"cols":4}. '
-            "Rows/cols must be positive integers (1-20). "
-            'If the image cannot be expressed as an N x N (or N x M) grid, respond {"rows":0,"cols":0} (i.e., 0x0).'
-        )
+        prompt = get_grid_detect_prompt()
 
         try:
             resp = await self.context.llm_generate(
@@ -1431,17 +1562,28 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         if not available_images:
             if cleaned_text:
-                yield event.plain_result(
-                    "⚠️ 当前模型只返回了文本，请检查模型配置或者重试"
-                )
+                async for res in self._safe_send(
+                    event,
+                    event.plain_result(
+                        "⚠️ 当前模型只返回了文本，请检查模型配置或者重试"
+                    ),
+                ):
+                    yield res
                 if text_to_send:
-                    yield event.plain_result(f"📝 {text_to_send}")
+                    async for res in self._safe_send(
+                        event, event.plain_result(f"📝 {text_to_send}")
+                    ):
+                        yield res
             else:
-                yield event.plain_result(
-                    "❌ 未能成功生成图像。\n"
-                    "🧐 可能原因：模型返回空结果、提示词冲突或参考图处理异常。\n"
-                    "✅ 建议：简化描述、减少参考图数量后再试，或稍后重试。"
-                )
+                async for res in self._safe_send(
+                    event,
+                    event.plain_result(
+                        "❌ 未能成功生成图像。\n"
+                        "🧐 可能原因：模型返回空结果、提示词冲突或参考图处理异常。\n"
+                        "✅ 建议：简化描述、减少参考图数量后再试，或稍后重试。"
+                    ),
+                ):
+                    yield res
             return
 
         # 单图直发
@@ -1449,14 +1591,21 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             logger.info("[SEND] 采用单图直发模式")
             if text_to_send:
                 # 富媒体链式发送：文本+图片
-                yield event.chain_result(
-                    [
-                        Comp.Plain(f"\u200b📝 {text_to_send}"),
-                        self._build_forward_image_component(available_images[0]),
-                    ]
-                )
+                async for res in self._safe_send(
+                    event,
+                    event.chain_result(
+                        [
+                            Comp.Plain(f"\u200b📝 {text_to_send}"),
+                            self._build_forward_image_component(available_images[0]),
+                        ]
+                    ),
+                ):
+                    yield res
             else:
-                yield event.image_result(available_images[0])
+                async for res in self._safe_send(
+                    event, event.image_result(available_images[0])
+                ):
+                    yield res
             if thought_signature:
                 logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
             return
@@ -1470,7 +1619,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             for img in available_images:
                 chain.append(self._build_forward_image_component(img))
             if chain:
-                yield event.chain_result(chain)
+                async for res in self._safe_send(event, event.chain_result(chain)):
+                    yield res
             if thought_signature:
                 logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
             return
@@ -1514,7 +1664,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         node = Node(uin=sender_id, name=sender_name, content=node_content)
         # 群合并转发需用 chain_result 包裹 Node
-        yield event.chain_result([node])
+        async for res in self._safe_send(event, event.chain_result([node])):
+            yield res
 
         if thought_signature:
             logger.debug(f"🧠 思维签名: {thought_signature[:50]}...")
@@ -1539,9 +1690,6 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             ref_images, avatars = await self._fetch_images_from_event(
                 event, include_at_avatars=use_avatar
             )
-            self.log_debug(
-                f"[MODIFY_DEBUG] 收集到消息图片 {len(ref_images)} 张，头像 {len(avatars)} 个"
-            )
 
             all_ref_images: list[str] = []
             all_ref_images.extend(
@@ -1552,39 +1700,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     self._filter_valid_reference_images(avatars, source="头像")
                 )
 
-            self.log_debug(f"[MODIFY_DEBUG] 有效参考图片总数: {len(all_ref_images)}")
-
-            # 改图提示词增强 - 检测是否包含修改意图关键词
-            modify_keywords = [
-                "修改",
-                "改图",
-                "改成",
-                "变成",
-                "调整",
-                "优化",
-                "重做",
-                "更换",
-                "替换",
-                "删除",
-                "添加",
-            ]
-            is_modification_request = any(
-                keyword in prompt for keyword in modify_keywords
+            enhanced_prompt, is_modification_request = build_quick_prompt(
+                prompt, skip_figure_enhance=skip_figure_enhance
             )
-            self.log_debug(f"[MODIFY_DEBUG] 修改关键词匹配: {is_modification_request}")
-
-            figure_keywords = ["手办", "figure", "模型", "手办化", "手办模型"]
-            if (not skip_figure_enhance) and any(
-                keyword in prompt.lower() for keyword in figure_keywords
-            ):
-                enhanced_prompt = enhance_prompt_for_figure(prompt)
-                self.log_debug("[MODIFY_DEBUG] 使用手办化提示词增强")
-            elif is_modification_request:
-                # 对于改图请求，进一步强化提示词
-                enhanced_prompt = get_auto_modification_prompt(prompt)
-                self.log_debug("[MODIFY_DEBUG] 使用改图提示词增强")
-            else:
-                enhanced_prompt = prompt
 
             effective_resolution = self.resolution
             effective_aspect_ratio = self.aspect_ratio
@@ -1681,11 +1799,20 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         generation_prompt = get_generation_prompt(prompt)
 
         yield event.plain_result("🎨 开始生成图像...")
+        api_start_time = time.perf_counter()
 
         async for result in self._quick_generate_image(
             event, generation_prompt, use_avatar
         ):
             yield result
+        try:
+            api_duration = time.perf_counter() - api_start_time
+            async for res in self._safe_send(
+                event, event.plain_result(f"⏱️ API耗时 {api_duration:.1f}s")
+            ):
+                yield res
+        except Exception:
+            pass
 
     async def _handle_quick_mode(
         self,
@@ -1705,6 +1832,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return
 
         yield event.plain_result(f"🎨 使用{mode_name}模式生成图像...")
+        api_start_time = time.perf_counter()
 
         old_resolution = self.resolution
         old_aspect_ratio = self.aspect_ratio
@@ -1729,6 +1857,14 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         finally:
             self.resolution = old_resolution
             self.aspect_ratio = old_aspect_ratio
+            try:
+                api_duration = time.perf_counter() - api_start_time
+                async for res in self._safe_send(
+                    event, event.plain_result(f"⏱️ API耗时 {api_duration:.1f}s")
+                ):
+                    yield res
+            except Exception:
+                pass
 
     @filter.command_group("快速")
     def quick_mode_group(self):
@@ -1865,6 +2001,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             if simple_mode
             else get_sticker_prompt(user_prompt)
         )
+        api_start_time = time.perf_counter()
         old_resolution = self.resolution
         old_aspect_ratio = self.aspect_ratio
 
@@ -1882,14 +2019,18 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 reference_images=reference_images,
                 avatar_reference=avatar_reference,
             )
+            api_duration = time.perf_counter() - api_start_time
 
             if not success or not isinstance(result_data, tuple):
-                error_msg = (
-                    f"{result_data}\n🧐 可能原因：参考图不可用、网络波动或模型返回空结果。\n✅ 建议：确认图片可访问、简化提示词后再试。"
-                    if isinstance(result_data, str)
-                    else "❌ 表情包生成未成功。\n🧐 可能原因：模型未返回有效结果或参考图处理失败。\n✅ 建议：重新上传参考图或稍后再试。"
-                )
-                yield event.plain_result(error_msg)
+                # 如果上游已经返回了带原因的错误字符串，直接透传以避免重复提示
+                if isinstance(result_data, str):
+                    yield event.plain_result(result_data)
+                else:
+                    yield event.plain_result(
+                        "❌ 表情包生成未成功。\n"
+                        "🧐 可能原因：模型未返回有效结果或参考图处理失败。\n"
+                        "✅ 建议：重新上传参考图或稍后再试。"
+                    )
                 return
 
             image_urls, image_paths, text_content, thought_signature = result_data
@@ -1916,6 +2057,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
             # 1. 切割图片
             yield event.plain_result("✂️ 正在切割图片...")
+            split_start_time = time.perf_counter()
             try:
                 # 优先尝试视觉识别裁剪，失败则回退网格裁剪
                 split_files: list[str] = []
@@ -1927,21 +2069,38 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         primary_image_path,
                         rows=6,
                         cols=4,
+                        use_sticker_cutter=True,
                         ai_rows=ai_rows,
                         ai_cols=ai_cols,
                     )
+                split_duration = time.perf_counter() - split_start_time
             except Exception as e:
                 logger.error(f"切割图片时发生异常: {e}")
                 split_files = []
+                split_duration = time.perf_counter() - split_start_time
 
             if not split_files:
-                yield event.plain_result(
-                    "❌ 图片切割失败，无法生成表情包切片。\n"
-                    "🧐 可能原因：源图尺寸异常、裁剪依赖缺失或磁盘空间不足。\n"
-                    "✅ 建议：尝试降低分辨率重新生成，检查本地裁剪依赖与磁盘空间后再试。"
-                )
-                yield event.image_result(primary_image_path)
+                async for res in self._safe_send(
+                    event,
+                    event.plain_result(
+                        "❌ 图片切割失败，无法生成表情包切片。\n"
+                        "🧐 可能原因：源图尺寸异常、裁剪依赖缺失或磁盘空间不足。\n"
+                        "✅ 建议：尝试降低分辨率重新生成，检查本地裁剪依赖与磁盘空间后再试。"
+                    ),
+                ):
+                    yield res
+                async for res in self._safe_send(
+                    event, event.image_result(primary_image_path)
+                ):
+                    yield res
                 return
+
+            try:
+                yield event.plain_result(
+                    f"⏱️ API耗时 {api_duration:.1f}s，切割耗时 {split_duration:.1f}s"
+                )
+            except Exception:
+                pass
 
             # 2. 准备发送逻辑
 
@@ -1953,20 +2112,34 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         from astrbot.api.message_components import File
 
                         file_comp = File(file=zip_path, name=os.path.basename(zip_path))
-                        yield event.chain_result([file_comp])
+                        async for res in self._safe_send(
+                            event, event.chain_result([file_comp])
+                        ):
+                            yield res
                         sent_success = True
 
-                        yield event.image_result(primary_image_path)
+                        async for res in self._safe_send(
+                            event, event.image_result(primary_image_path)
+                        ):
+                            yield res
                     except Exception as e:
                         logger.warning(f"发送ZIP失败: {e}")
-                        yield event.plain_result("⚠️ 压缩包发送失败，降级使用合并转发")
+                        async for res in self._safe_send(
+                            event,
+                            event.plain_result("⚠️ 压缩包发送失败，降级使用合并转发"),
+                        ):
+                            yield res
                         sent_success = False
                 else:
-                    yield event.plain_result(
-                        "❌ 压缩包创建失败，已尝试改用合并转发。\n"
-                        "🧐 可能原因：临时目录无写权限或磁盘空间不足。\n"
-                        "✅ 建议：清理磁盘或调整临时目录权限后重试，如仍失败可关闭 ZIP 发送。"
-                    )
+                    async for res in self._safe_send(
+                        event,
+                        event.plain_result(
+                            "❌ 压缩包创建失败，已尝试改用合并转发。\n"
+                            "🧐 可能原因：临时目录无写权限或磁盘空间不足。\n"
+                            "✅ 建议：清理磁盘或调整临时目录权限后重试，如仍失败可关闭 ZIP 发送。"
+                        ),
+                    ):
+                        yield res
                     sent_success = False
 
             # 3. 如果没开启ZIP或者ZIP发送失败，发送合并转发
@@ -1983,6 +2156,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 except Exception:
                     pass
                 node_content.append(Plain("表情包切片："))
+                node_content.append(
+                    Plain("如果切图失败请尝试使用“切图 x x”手动指定行列，例如 切图 4 6")
+                )
 
                 for file_path in split_files:
                     try:
@@ -1997,7 +2173,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     content=node_content,
                 )
 
-                yield event.chain_result([node])
+                async for res in self._safe_send(event, event.chain_result([node])):
+                    yield res
 
         finally:
             self.resolution = old_resolution
@@ -2008,7 +2185,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 pass
 
     @filter.command("切图")
-    async def split_image_command(self, event: AstrMessageEvent, grid: str | None = None):
+    async def split_image_command(
+        self, event: AstrMessageEvent, grid: str | None = None
+    ):
         """对消息中的图片进行切割；支持手动指定网格，例如“切图 46”表示横4列竖6行"""
         manual_cols: int | None = None
         manual_rows: int | None = None
@@ -2018,7 +2197,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         # 兼容部分调用场景，若参数为空则尝试从原始消息提取命令后的文本
         if not grid_text:
             try:
-                raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", "")
+                raw_msg = getattr(
+                    getattr(event, "message_obj", None), "raw_message", ""
+                )
                 if isinstance(raw_msg, str):
                     grid_text = raw_msg
                 elif isinstance(raw_msg, dict):
@@ -2064,67 +2245,37 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             event, include_at_avatars=False
         )
         if not ref_images:
-            yield event.plain_result(
-                "❌ 未找到可切割的图片。\n"
-                "🧐 可能原因：消息中未包含图片、引用消息或合并转发内无图片。\n"
-                "✅ 建议：请在指令中附带图片，或回复/引用包含图片的消息后再试。"
-            )
+            async for res in self._safe_send(
+                event,
+                event.plain_result(
+                    "❌ 未找到可切割的图片。\n"
+                    "🧐 可能原因：消息中未包含图片、引用消息或合并转发内无图片。\n"
+                    "✅ 建议：请在指令中附带图片，或回复/引用包含图片的消息后再试。"
+                ),
+            ):
+                yield res
             return
 
         src = ref_images[0]
-        local_path = None
-
-        # 1) 已有本地文件
-        if isinstance(src, str) and Path(src).exists():
-            local_path = src
-        else:
-            try:
-                # 2) base64/data URL
-                if isinstance(src, str) and self._is_valid_base64_image_str(src):
-                    b64_data = src
-                    if ";base64," in src:
-                        _, _, b64_data = src.partition(";base64,")
-                    data = base64.b64decode(b64_data)
-                    tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
-                    tmp_path.write_bytes(data)
-                    local_path = str(tmp_path)
-                # 3) URL 下载（含 qpic/nt.qq 直链）
-                elif isinstance(src, str) and src.startswith(("http://", "https://")):
-                    data_url = await self._download_qq_image(src)
-                    if not data_url and self.api_client:
-                        mime_type, b64 = await self.api_client._normalize_image_input(
-                            src, image_input_mode=self.image_input_mode
-                        )
-                        if b64:
-                            data_url = (
-                                b64
-                                if self.image_input_mode == "force_base64"
-                                else f"data:{mime_type};base64,{b64}"
-                            )
-
-                    if data_url and self._is_valid_base64_image_str(data_url):
-                        b64_data = data_url
-                        if ";base64," in data_url:
-                            _, _, b64_data = data_url.partition(";base64,")
-                        data = base64.b64decode(b64_data)
-                        tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
-                        tmp_path.write_bytes(data)
-                        local_path = str(tmp_path)
-                # 4) 其他字符串尝试当作 base64
-                elif isinstance(src, str):
-                    data = base64.b64decode(src)
-                    tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
-                    tmp_path.write_bytes(data)
-                    local_path = str(tmp_path)
-            except Exception as e:
-                logger.warning(f"切图解析图片失败: {e}")
+        local_path = await resolve_split_source_to_path(
+            src,
+            image_input_mode=self.image_input_mode,
+            api_client=self.api_client,
+            download_qq_image_fn=self._download_qq_image,
+            logger_obj=logger,
+            event=event,
+        )
 
         if not local_path:
-            yield event.plain_result(
-                "❌ 图片下载/解析失败，无法进行切割。\n"
-                "🧐 可能原因：图片链接失效、群文件无权限或格式不受支持。\n"
-                "✅ 建议：重新发送清晰可访问的图片后再试。"
-            )
+            async for res in self._safe_send(
+                event,
+                event.plain_result(
+                    "❌ 图片下载/解析失败，无法进行切割。\n"
+                    "🧐 可能原因：图片链接失效、群文件无权限或格式不受支持。\n"
+                    "✅ 建议：重新发送清晰可访问的图片后再试。"
+                ),
+            ):
+                yield res
             return
 
         ai_rows: int | None = None
@@ -2137,7 +2288,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 ai_detected = True
 
         if manual_cols and manual_rows:
-            yield event.plain_result(f"✂️ 按 {manual_cols}x{manual_rows} 网格切割图片...")
+            yield event.plain_result(
+                f"✂️ 按 {manual_cols}x{manual_rows} 网格切割图片..."
+            )
         elif ai_detected and ai_rows and ai_cols:
             yield event.plain_result(
                 f"🤖 AI 识别到 {ai_cols}x{ai_rows} 网格，优先切割..."
@@ -2152,6 +2305,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         split_files: list[str] = []
         try:
+            split_start_time = time.perf_counter()
             split_files = await asyncio.to_thread(
                 split_image,
                 local_path,
@@ -2163,20 +2317,29 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 ai_rows=ai_rows,
                 ai_cols=ai_cols,
             )
+            split_duration = time.perf_counter() - split_start_time
         except Exception as e:
             logger.error(f"切割图片时发生异常: {e}")
             split_files = []
+            split_duration = None
 
         if not split_files:
-            yield event.plain_result(
-                "❌ 图片切割失败，未生成有效切片。\n"
-                "🧐 可能原因：图片格式/尺寸异常，或切割依赖缺失。\n"
-                "✅ 建议：尝试更换图片或检查依赖后重试。"
-            )
+            async for res in self._safe_send(
+                event,
+                event.plain_result(
+                    "❌ 图片切割失败，未生成有效切片。\n"
+                    "🧐 可能原因：图片格式/尺寸异常，或切割依赖缺失。\n"
+                    "✅ 建议：尝试更换图片或检查依赖后重试。"
+                ),
+            ):
+                yield res
             return
 
         from astrbot.api.message_components import Image as AstrImage
         from astrbot.api.message_components import Node, Plain
+
+        if split_duration is not None:
+            yield event.plain_result(f"⏱️ 切割耗时 {split_duration:.1f}s")
 
         node_content = [Plain("切片：")]
         for file_path in split_files:
@@ -2321,7 +2484,15 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             if self.html_render_options.get("quality") is not None:
                 render_opts["quality"] = self.html_render_options["quality"]
             # 透传更多渲染选项以提升清晰度
-            for key in ("type", "full_page", "omit_background", "scale", "animations", "caret", "timeout"):
+            for key in (
+                "type",
+                "full_page",
+                "omit_background",
+                "scale",
+                "animations",
+                "caret",
+                "timeout",
+            ):
                 if key in self.html_render_options:
                     render_opts[key] = self.html_render_options[key]
 
@@ -2384,6 +2555,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         modification_prompt = get_modification_prompt(prompt)
 
         yield event.plain_result("🎨 开始修改图像...")
+        api_start_time = time.perf_counter()
 
         # 根据配置决定是否使用头像参考
         use_avatar = await self.should_use_avatar(event)
@@ -2392,6 +2564,14 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             event, modification_prompt, use_avatar
         ):
             yield result
+        try:
+            api_duration = time.perf_counter() - api_start_time
+            async for res in self._safe_send(
+                event, event.plain_result(f"⏱️ API耗时 {api_duration:.1f}s")
+            ):
+                yield res
+        except Exception:
+            pass
 
     @filter.command("换风格")
     async def change_style(self, event: AstrMessageEvent, style: str, prompt: str = ""):
@@ -2416,6 +2596,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         )
 
         yield event.plain_result("🎨 开始转换风格...")
+        api_start_time = time.perf_counter()
 
         success, result_data = await self._generate_image_core_internal(
             event=event,
@@ -2438,6 +2619,14 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 yield send_res
         else:
             yield event.plain_result(result_data)
+        try:
+            api_duration = time.perf_counter() - api_start_time
+            async for res in self._safe_send(
+                event, event.plain_result(f"⏱️ API耗时 {api_duration:.1f}s")
+            ):
+                yield res
+        except Exception:
+            pass
 
     @filter.llm_tool(name="gemini_image_generation")
     async def generate_image_tool(
@@ -2472,10 +2661,10 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         if not self.api_client:
             return [
                 Comp.Plain(
-                "❌ 无法生成图像：API 客户端尚未初始化。\n"
-                "🧐 可能原因：API 密钥未配置或加载失败。\n"
-                "✅ 建议：在插件配置中填写有效密钥并重启服务。"
-            )
+                    "❌ 无法生成图像：API 客户端尚未初始化。\n"
+                    "🧐 可能原因：API 密钥未配置或加载失败。\n"
+                    "✅ 建议：在插件配置中填写有效密钥并重启服务。"
+                )
             ]
 
         reference_images = []

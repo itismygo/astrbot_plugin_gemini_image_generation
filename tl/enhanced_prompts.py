@@ -55,7 +55,7 @@ def get_mobile_prompt(prompt: str) -> str:
 def get_sticker_prompt(prompt: str = "") -> str:
     """获取表情包提示词"""
     base_prompt = """为我生成图中角色的绘制 Q 版的，LINE 风格的半身像表情包，注意头饰要正确
-彩色手绘风格，严格按照4*4布局均匀分布，白色背景，涵盖各种各样的常用聊天语句，或是一些有关的娱乐 meme
+彩色手绘风格，严格按照4*4布局，均匀分布，白色背景，涵盖各种各样的常用聊天语句，或是一些有关的娱乐 meme
 其他需求：不要原图复制，高清修复，高质量。所有标注为手写的简体中文。
 """
 
@@ -178,9 +178,60 @@ def enhance_prompt_for_figure(prompt: str) -> str:
 def get_q_version_sticker_prompt(prompt: str = "") -> str:
     """英文版Q版表情包提示词"""
     base_prompt = """Generate a Q version drawing of the characters in the image, in LINE style, with half-body expressions, ensuring the headgear is correct.
-Color hand-drawn style, strictly following a 4*4 layout evenly distributed, with a white background, covering a variety of commonly used chat phrases or some related entertainment memes.
+
+Color hand-drawn style, strictly following a 4*4 layout with uniform spacing and even distribution. White background. Cover a variety of commonly used chat phrases and related entertainment memes.
+
+Layout requirements:
+- Ensure each sticker is evenly spaced across the grid
+- Do not crowd or overlap expressions
+- Maintain consistent margins between each cell
+- Leave adequate padding around each character
+
 Other requirements: Do not copy the original image, high-definition restoration, high quality. All annotations should be simple symbols or in English."""
 
     if prompt.strip():
         return f"{base_prompt}\n\nAdditional user requirements: {prompt}"
     return base_prompt
+
+
+def get_grid_detect_prompt() -> str:
+    """表情包网格识别提示词"""
+    return (
+        "Analyze the image and count the grid of stickers/emojis. "
+        'Respond ONLY in JSON like {"rows":4,"cols":4}. '
+        "Rows/cols must be positive integers (1-20). "
+        'If the image cannot be expressed as an N x N (or N x M) grid, respond {"rows":0,"cols":0} (i.e., 0x0).'
+    )
+
+
+def build_quick_prompt(
+    prompt: str, *, skip_figure_enhance: bool = False
+) -> tuple[str, bool]:
+    """快捷模式统一提示词构建，返回(增强后的提示词, 是否判定为改图)"""
+    modify_keywords = [
+        "修改",
+        "改图",
+        "改成",
+        "变成",
+        "调整",
+        "优化",
+        "重做",
+        "更换",
+        "替换",
+        "删除",
+        "添加",
+    ]
+    figure_keywords = ["手办", "figure", "模型", "手办化", "手办模型"]
+
+    is_modification_request = any(keyword in prompt for keyword in modify_keywords)
+
+    if (not skip_figure_enhance) and any(
+        keyword in prompt.lower() for keyword in figure_keywords
+    ):
+        enhanced_prompt = enhance_prompt_for_figure(prompt)
+    elif is_modification_request:
+        enhanced_prompt = get_auto_modification_prompt(prompt)
+    else:
+        enhanced_prompt = prompt
+
+    return enhanced_prompt, is_modification_request
