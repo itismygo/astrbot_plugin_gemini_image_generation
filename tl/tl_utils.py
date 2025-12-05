@@ -81,8 +81,11 @@ def _pick_avatar_url(data: dict | None) -> str | None:
     return None
 
 
-def _encode_file_to_base64(file_path: Path, chunk_size: int = 65536) -> str:
-    """流式编码文件为base64，避免一次性占用大量内存"""
+def _encode_file_to_base64(file_path: Path, chunk_size: int = 65532) -> str:
+    """流式编码文件为base64，避免一次性占用大量内存
+    注意：chunk_size 必须是 3 的倍数，否则分块编码会导致中间出现 padding，破坏 base64 结构
+    65532 是 65536 以内最大的 3 的倍数
+    """
     encoded_parts: list[str] = []
     with open(file_path, "rb") as f:
         while True:
@@ -93,7 +96,7 @@ def _encode_file_to_base64(file_path: Path, chunk_size: int = 65536) -> str:
     return "".join(encoded_parts)
 
 
-def encode_file_to_base64(file_path: str | Path, chunk_size: int = 65536) -> str:
+def encode_file_to_base64(file_path: str | Path, chunk_size: int = 65532) -> str:
     """对外暴露的编码方法，兼容字符串路径"""
     return _encode_file_to_base64(Path(file_path), chunk_size)
 
@@ -185,6 +188,29 @@ async def save_image_data(image_data: bytes, image_format: str = "png") -> str |
 
     except Exception as e:
         logger.error(f"保存图像失败: {e}")
+        return None
+
+
+async def download_image_to_path(url: str) -> str | None:
+    """
+    下载图片到本地文件
+
+    Args:
+        url: 图片URL
+
+    Returns:
+        保存的文件路径，失败返回None
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    logger.error(f"下载图片失败: {response.status}")
+                    return None
+                data = await response.read()
+                return await save_image_data(data)
+    except Exception as e:
+        logger.error(f"下载图片异常: {e}")
         return None
 
 

@@ -53,6 +53,7 @@ from .tl.tl_api import (
 from .tl.tl_utils import (
     AvatarManager,
     cleanup_old_images,
+    download_image_to_path,
     download_qq_avatar,
     send_file,
 )
@@ -1907,6 +1908,15 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 )
                 return
 
+            # 如果是URL，先下载到本地
+            if primary_image_path.startswith(("http://", "https://")):
+                local_path = await download_image_to_path(primary_image_path)
+                if local_path:
+                    primary_image_path = local_path
+                else:
+                    yield event.plain_result("❌ 下载生成的图片失败，无法进行切割。")
+                    return
+
             ai_rows = None
             ai_cols = None
             if self.vision_provider_id:
@@ -1929,6 +1939,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         cols=4,
                         ai_rows=ai_rows,
                         ai_cols=ai_cols,
+                        use_black_line_cutter=True,
+                        stroke_size=10,
                     )
             except Exception as e:
                 logger.error(f"切割图片时发生异常: {e}")
@@ -2009,10 +2021,11 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
     @filter.command("切图")
     async def split_image_command(self, event: AstrMessageEvent, grid: str | None = None):
-        """对消息中的图片进行切割；支持手动指定网格，例如“切图 46”表示横4列竖6行"""
+        """对消息中的图片进行切割；支持手动指定网格，例如“切图 46”表示横4列竖6行；支持“切图 黑线”使用黑线分割"""
         manual_cols: int | None = None
         manual_rows: int | None = None
         use_sticker_cutter = False
+        use_black_line_cutter = True  # 默认启用黑线分割算法
         grid_text = grid or ""
 
         # 兼容部分调用场景，若参数为空则尝试从原始消息提取命令后的文本
@@ -2051,6 +2064,11 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 # 检测是否要求主体吸附分割（仅保留“吸附”关键词）
                 if "吸附" in grid_text:
                     use_sticker_cutter = True
+                    use_black_line_cutter = False
+                
+                # 检测是否要求黑线分割
+                if "黑线" in grid_text:
+                    use_black_line_cutter = True
 
                 manual_cols, manual_rows = _parse_manual_grid(grid_text)
 
@@ -2130,7 +2148,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         ai_rows: int | None = None
         ai_cols: int | None = None
         ai_detected = False
-        if not (manual_cols and manual_rows) and self.vision_provider_id:
+        # 如果启用了黑线分割（默认启用），则跳过 AI 识别，优先尝试算法
+        if not (manual_cols and manual_rows) and self.vision_provider_id and not use_black_line_cutter:
             ai_res = await self._detect_grid_rows_cols(local_path)
             if ai_res:
                 ai_rows, ai_cols = ai_res
@@ -2144,6 +2163,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             )
         elif use_sticker_cutter:
             yield event.plain_result("✂️ 使用主体吸附分割算法切图...")
+        elif use_black_line_cutter:
+            yield event.plain_result("✂️ 正在使用算法切图...")
         else:
             tip = "✂️ 正在切割图片..."
             if grid:
@@ -2162,6 +2183,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 use_sticker_cutter=use_sticker_cutter,
                 ai_rows=ai_rows,
                 ai_cols=ai_cols,
+                use_black_line_cutter=use_black_line_cutter,
             )
         except Exception as e:
             logger.error(f"切割图片时发生异常: {e}")

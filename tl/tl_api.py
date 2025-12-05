@@ -29,6 +29,7 @@ try:
         SUPPORTED_IMAGE_MIME_TYPES,
         coerce_supported_image,
         coerce_supported_image_bytes,
+        download_image_to_path,
         encode_file_to_base64,
         get_plugin_data_dir,
         normalize_image_input,
@@ -423,21 +424,17 @@ class GeminiAPIClient:
                 image_payload: dict[str, Any] | None = None
 
                 try:
-                    # 优先处理 http(s) URL，确保 scheme 和 netloc 合法
+                    ext = Path(parsed.path).suffix.lower().lstrip(".")
+                    is_valid_ext = ext in supported_exts
+
+                    # 1. 优先处理 http(s) URL，确保 scheme 和 netloc 合法
+                    # 仅当 URL 具有明确的图片后缀且未强制 base64 时才直接传递 URL
                     if (
                         parsed.scheme in ("http", "https")
                         and parsed.netloc
                         and not force_b64
+                        and is_valid_ext
                     ):
-                        ext = Path(parsed.path).suffix.lower().lstrip(".")
-                        if ext and ext not in supported_exts:
-                            logger.debug(
-                                "参考图像URL扩展名不在常见列表: idx=%s ext=%s url=%s",
-                                idx,
-                                ext,
-                                image_str[:80],
-                            )
-
                         image_payload = {
                             "type": "image_url",
                             "image_url": {"url": image_str},
@@ -448,6 +445,26 @@ class GeminiAPIClient:
                             ext or "unknown",
                             image_str[:120],
                         )
+
+                    # 2. 如果是 URL 但没有后缀 (或强制 base64)，下载并转 base64
+                    elif parsed.scheme in ("http", "https") and parsed.netloc:
+                        logger.debug(
+                            f"URL无明确后缀或强制Base64，尝试下载转换: {image_str[:60]}..."
+                        )
+                        local_path = await download_image_to_path(image_str)
+                        if local_path:
+                            b64_data = encode_file_to_base64(local_path)
+                            image_payload = {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{b64_data}"
+                                },
+                            }
+                            logger.debug(
+                                f"已将URL参考图转换为Base64: {len(b64_data)} chars"
+                            )
+                        else:
+                            logger.warning(f"下载参考图失败: {image_str}")
 
                     # data URL：直接校验 base64，有效则不再重复转码
                     elif (
