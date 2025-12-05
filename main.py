@@ -2417,62 +2417,19 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 pass
 
     @filter.command("切图")
-    async def split_image_command(self, event: AstrMessageEvent, grid: str | None = None):
-        """对消息中的图片进行切割；支持手动指定网格，例如“切图 46”表示横4列竖6行；支持“切图 黑线”使用黑线分割"""
-        manual_cols: int | None = None
-        manual_rows: int | None = None
-        use_black_line_cutter = True  # 默认启用黑线分割算法
-        grid_text = grid or ""
+    async def split_image_command(self, event: AstrMessageEvent):
+        """对消息中的图片进行智能切割，自动识别 2x2 网格"""
+        logger.info("[切图] 开始处理切图指令")
+        use_black_line_cutter = True
 
-        # 兼容部分调用场景，若参数为空则尝试从原始消息提取命令后的文本
-        if not grid_text:
-            try:
-                raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", "")
-                if isinstance(raw_msg, str):
-                    grid_text = raw_msg
-                elif isinstance(raw_msg, dict):
-                    grid_text = str(raw_msg.get("message", "")) or str(raw_msg)
-            except Exception:
-                grid_text = ""
-
-        def _parse_manual_grid(text: str) -> tuple[int | None, int | None]:
-            """只解析紧跟在“切图”指令后的数字，支持 4 4 / 44 / 4x4 格式"""
-            cleaned = text or ""
-            cmd_pos = cleaned.find("切图")
-            if cmd_pos != -1:
-                cleaned = cleaned[cmd_pos + len("切图") :]
-            cleaned = re.sub(r"\\[CQ:[^\\]]+\\]", " ", cleaned)
-            cleaned = cleaned.replace("[图片]", " ")
-            cleaned = re.sub(r"\s+", " ", cleaned).strip()
-            m = re.match(r"^(\d{1,2})\s*[xX*]\s*(\d{1,2})", cleaned)
-            if not m:
-                m = re.match(r"^(\d{1,2})\s+(\d{1,2})", cleaned)
-            if not m:
-                m = re.match(r"^(\d)(\d)$", cleaned)
-            if m:
-                c, r = int(m.group(1)), int(m.group(2))
-                if c > 0 and r > 0:
-                    return c, r
-            return None, None
-
-        if grid_text:
-            try:
-                # 检测是否要求黑线分割
-                if "黑线" in grid_text:
-                    use_black_line_cutter = True
-
-                manual_cols, manual_rows = _parse_manual_grid(grid_text)
-
-                if manual_cols is None or manual_rows is None:
-                    if grid_text.strip():
-                        logger.debug(f"未能解析切图网格参数: {grid_text}")
-            except Exception as e:
-                logger.debug(f"切图网格参数处理异常: {e}")
-
+        logger.info(f"[切图] 开始获取图片，use_black_line_cutter={use_black_line_cutter}")
         ref_images, _ = await self._fetch_images_from_event(
             event, include_at_avatars=False
         )
+        logger.info(f"[切图] 获取到 {len(ref_images)} 张图片")
+
         if not ref_images:
+            logger.warning("[切图] 未找到可切割的图片")
             yield event.plain_result(
                 "❌ 未找到可切割的图片。\n"
                 "🧐 可能原因：消息中未包含图片、引用消息或合并转发内无图片。\n"
@@ -2481,15 +2438,22 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return
 
         src = ref_images[0]
+        logger.info(f"[切图] 图片源类型: {type(src).__name__}, 内容前100字符: {str(src)[:100]}...")
         local_path = None
 
-        # 1) 已有本地文件
-        if isinstance(src, str) and Path(src).exists():
-            local_path = src
+        # 1) 已有本地文件（排除 data URL 和 http URL）
+        if isinstance(src, str) and not src.startswith(("data:", "http://", "https://")) and len(src) < 1000:
+            try:
+                if Path(src).exists():
+                    local_path = src
+                    logger.info(f"[切图] 使用本地文件: {local_path}")
+            except OSError as e:
+                logger.debug(f"[切图] 检查本地文件路径失败: {e}")
         else:
             try:
                 # 2) base64/data URL
                 if isinstance(src, str) and self._is_valid_base64_image_str(src):
+                    logger.info("[切图] 检测到 base64/data URL，开始解码...")
                     b64_data = src
                     if ";base64," in src:
                         _, _, b64_data = src.partition(";base64,")
@@ -2497,13 +2461,19 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                     tmp_path.write_bytes(data)
                     local_path = str(tmp_path)
+                    logger.info(f"[切图] base64 解码成功，保存到: {local_path}")
                 # 3) URL 下载（含 qpic/nt.qq 直链）
                 elif isinstance(src, str) and src.startswith(("http://", "https://")):
+                    logger.info(f"[切图] 检测到 URL，开始下载: {src[:80]}...")
                     data_url = await self._download_qq_image(src)
+                    logger.info(f"[切图] _download_qq_image 结果: {'成功' if data_url else '失败'}")
+
                     if not data_url and self.api_client:
+                        logger.info("[切图] 尝试使用 api_client._normalize_image_input...")
                         mime_type, b64 = await self.api_client._normalize_image_input(
                             src, image_input_mode=self.image_input_mode
                         )
+                        logger.info(f"[切图] _normalize_image_input 结果: mime={mime_type}, b64={'有数据' if b64 else '无数据'}")
                         if b64:
                             data_url = (
                                 b64
@@ -2519,16 +2489,22 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                         tmp_path.write_bytes(data)
                         local_path = str(tmp_path)
+                        logger.info(f"[切图] URL 下载成功，保存到: {local_path}")
+                    else:
+                        logger.warning(f"[切图] URL 下载失败或数据无效")
                 # 4) 其他字符串尝试当作 base64
                 elif isinstance(src, str):
+                    logger.info("[切图] 尝试将字符串当作 base64 解码...")
                     data = base64.b64decode(src)
                     tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                     tmp_path.write_bytes(data)
                     local_path = str(tmp_path)
+                    logger.info(f"[切图] base64 解码成功，保存到: {local_path}")
             except Exception as e:
-                logger.warning(f"切图解析图片失败: {e}")
+                logger.warning(f"切图解析图片失败: {e}", exc_info=True)
 
         if not local_path:
+            logger.error("[切图] 无法获取本地图片路径")
             yield event.plain_result(
                 "❌ 图片下载/解析失败，无法进行切割。\n"
                 "🧐 可能原因：图片链接失效、群文件无权限或格式不受支持。\n"
@@ -2536,52 +2512,36 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             )
             return
 
-        ai_rows: int | None = None
-        ai_cols: int | None = None
-        ai_detected = False
-        # 如果启用了黑线分割（默认启用），则跳过 AI 识别，优先尝试算法
-        if not (manual_cols and manual_rows) and self.vision_provider_id and not use_black_line_cutter:
-            ai_res = await self._detect_grid_rows_cols(local_path)
-            if ai_res:
-                ai_rows, ai_cols = ai_res
-                ai_detected = True
+        logger.info(f"[切图] 本地图片路径: {local_path}")
 
-        if manual_cols and manual_rows:
-            yield event.plain_result(f"✂️ 按 {manual_cols}x{manual_rows} 网格切割图片...")
-        elif ai_detected and ai_rows and ai_cols:
-            yield event.plain_result(
-                f"🤖 AI 识别到 {ai_cols}x{ai_rows} 网格，优先切割..."
-            )
-        elif not use_black_line_cutter:
-            tip = "✂️ 正在切割图片..."
-            if grid:
-                tip += "（网格参数未解析，已使用智能切割）"
-            yield event.plain_result(tip)
+        yield event.plain_result("✂️ 正在智能切割 2x2 网格图片...")
+
+        logger.info(f"[切图] 开始调用 split_image: local_path={local_path}, use_black_line_cutter={use_black_line_cutter}")
 
         split_files: list[str] = []
         try:
             split_files = await asyncio.to_thread(
                 split_image,
                 local_path,
-                rows=6,
-                cols=4,
-                manual_rows=manual_rows,
-                manual_cols=manual_cols,
-                ai_rows=ai_rows,
-                ai_cols=ai_cols,
+                rows=2,
+                cols=2,
                 use_black_line_cutter=use_black_line_cutter,
             )
+            logger.info(f"[切图] split_image 返回 {len(split_files)} 个文件")
         except Exception as e:
-            logger.error(f"切割图片时发生异常: {e}")
+            logger.error(f"切割图片时发生异常: {e}", exc_info=True)
             split_files = []
 
         if not split_files:
+            logger.error("[切图] 切割失败，未生成有效切片")
             yield event.plain_result(
                 "❌ 图片切割失败，未生成有效切片。\n"
                 "🧐 可能原因：图片格式/尺寸异常，或切割依赖缺失。\n"
                 "✅ 建议：尝试更换图片或检查依赖后重试。"
             )
             return
+
+        logger.info(f"[切图] 切割成功，生成 {len(split_files)} 个切片: {split_files[:3]}...")
 
         from astrbot.api.message_components import Image as AstrImage
         from astrbot.api.message_components import Node, Plain
