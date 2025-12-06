@@ -2581,8 +2581,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         self,
         event: AstrMessageEvent,
         prompt: str,
-        use_reference_images: str,
-        include_user_avatar: str,
+        use_reference_images: str = "false",
+        include_user_avatar: str = "false",
         **kwargs,
     ) -> list[Any]:
         """
