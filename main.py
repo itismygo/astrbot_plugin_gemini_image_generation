@@ -962,11 +962,12 @@ class GeminiImageGenerationPlugin(Star):
                 conversion_cache[img_source] = source_str
                 return source_str
 
-            # 强制 base64 模式
-            if image_mode == "force_base64":
+            # 强制 base64 模式，或者 OpenAI 兼容 API（不支持直接 URL）
+            # OpenAI 兼容 API 需要 base64 格式，否则会报 Unknown mimetype
+            if image_mode == "force_base64" or self.api_type == "openai":
                 return await to_data_url(source_str)
 
-            # auto / prefer_url：对 http(s) 链接保留 URL，其他情况转 base64
+            # auto / prefer_url（仅 Google API）：对 http(s) 链接保留 URL，其他情况转 base64
             if source_str.startswith("http://") or source_str.startswith("https://"):
                 cleaned_url = source_str.replace("&amp;", "&")
                 conversion_cache[img_source] = cleaned_url
