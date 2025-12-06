@@ -2233,17 +2233,14 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     return c, r
             return None, None
 
+        # 检测是否要求主体吸附分割
+        if "吸附" in grid_text:
+            use_sticker_cutter = True
+            logger.info("检测到吸附关键词，启用主体吸附分割")
+
         if grid_text:
             try:
-                # 检测是否要求主体吸附分割（仅保留“吸附”关键词）
-                if "吸附" in grid_text:
-                    use_sticker_cutter = True
-
                 manual_cols, manual_rows = _parse_manual_grid(grid_text)
-
-                if manual_cols is None or manual_rows is None:
-                    if grid_text.strip():
-                        logger.debug(f"未能解析切图网格参数: {grid_text}")
             except Exception as e:
                 logger.debug(f"切图网格参数处理异常: {e}")
 
@@ -2269,7 +2266,6 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             api_client=self.api_client,
             download_qq_image_fn=self._download_qq_image,
             logger_obj=logger,
-            event=event,
         )
 
         if not local_path:
