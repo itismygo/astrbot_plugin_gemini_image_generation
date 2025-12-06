@@ -13,7 +13,7 @@ import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 import aiohttp
 import yaml
@@ -55,8 +55,15 @@ from .tl.tl_utils import (
     cleanup_old_images,
     download_image_to_path,
     download_qq_avatar,
+    download_qq_image_with_headers,
+    is_valid_base64_image_str,
     send_file,
 )
+
+# 类型别名定义
+ImageUrl: TypeAlias = str  # 图片URL或base64数据
+ImagePath: TypeAlias = str  # 本地文件路径
+ImageGenerationResult: TypeAlias = tuple[list[ImageUrl], list[ImagePath], str | None, str | None]
 
 
 @register(
@@ -527,19 +534,30 @@ class GeminiImageGenerationPlugin(Star):
         logger.debug(message)
 
     @staticmethod
-    def _is_valid_base64_image_str(value: str) -> bool:
-        """粗略判断字符串是否为有效的 base64 图像数据或 data URL"""
-        if not value:
-            return False
+    def _build_api_error_message(e: APIError) -> str:
+        """根据 APIError 构建用户友好的错误提示
 
-        if value.startswith("data:image/"):
-            return ";base64," in value
+        Args:
+            e: API 错误对象
 
-        try:
-            base64.b64decode(value, validate=True)
-            return True
-        except Exception:
-            return False
+        Returns:
+            格式化的错误消息字符串
+        """
+        status_part = f"（状态码 {e.status_code}）" if e.status_code is not None else ""
+        error_msg = f"❌ 图像生成失败{status_part}：{e.message}"
+
+        if e.status_code == 429:
+            error_msg += "\n🧐 可能原因：请求过于频繁或额度已用完。\n✅ 建议：稍等片刻再试，或在配置中增加可用额度/开启智能重试。"
+        elif e.status_code == 402:
+            error_msg += "\n🧐 可能原因：账户余额不足或套餐到期。\n✅ 建议：充值或更换一组可用的 API 密钥后再试。"
+        elif e.status_code == 403:
+            error_msg += "\n🧐 可能原因：API 密钥无效、权限不足或访问受限。\n✅ 建议：核对密钥权限、检查 IP 白名单，必要时重新生成密钥。"
+        elif e.status_code and 500 <= e.status_code < 600:
+            error_msg += "\n🧐 可能原因：上游服务暂时不可用。\n✅ 建议：稍后重试，若频繁出现请联系服务提供方确认故障。"
+        else:
+            error_msg += "\n🧐 可能原因：请求参数异常或服务返回未知错误。\n✅ 建议：简化提示词/减少参考图后重试，并查看日志获取更多细节。"
+
+        return error_msg
 
     @staticmethod
     def _clean_text_content(text: str) -> str:
@@ -613,7 +631,7 @@ class GeminiImageGenerationPlugin(Star):
                 )
                 continue
 
-            if self._is_valid_base64_image_str(cleaned):
+            if is_valid_base64_image_str(cleaned):
                 valid.append(cleaned)
             elif allow_url and (
                 cleaned.startswith("http://") or cleaned.startswith("https://")
@@ -798,46 +816,6 @@ class GeminiImageGenerationPlugin(Star):
         else:
             logger.error("✗ 未读取到 API 密钥，请确认 AstrBot 提供商中已配置 key")
 
-    async def _download_qq_image(self, url: str) -> str | None:
-        """对QQ图床做特殊处理，补充Referer/UA后转为base64"""
-        try:
-            parsed = urllib.parse.urlparse(url)
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
-                ),
-                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                "Connection": "keep-alive",
-            }
-            if parsed.netloc:
-                headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
-            if "qpic.cn" in (parsed.netloc or ""):
-                headers["Referer"] = "https://qun.qq.com"
-
-            timeout = aiohttp.ClientTimeout(total=12, connect=5)
-            async with aiohttp.ClientSession(
-                headers=headers, trust_env=True
-            ) as session:
-                async with session.get(url, timeout=timeout) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            f"QQ图片下载失败: HTTP {resp.status} {resp.reason} | {url[:80]}"
-                        )
-                        return None
-                    data = await resp.read()
-                    if not data:
-                        logger.warning(f"QQ图片为空: {url[:80]}")
-                        return None
-                    mime = resp.headers.get("Content-Type", "image/jpeg")
-                    if ";" in mime:
-                        mime = mime.split(";", 1)[0]
-                    base64_data = base64.b64encode(data).decode("utf-8")
-                    return f"data:{mime};base64,{base64_data}"
-        except Exception as e:
-            logger.warning(f"QQ图片下载异常: {e} | {url[:80]}")
-            return None
-
     async def _fetch_images_from_event(
         self, event: AstrMessageEvent, include_at_avatars: bool = False
     ) -> tuple[list[str], list[str]]:
@@ -927,7 +905,7 @@ class GeminiImageGenerationPlugin(Star):
                     return None
 
             # 直接返回已是 base64/data URL 的输入
-            if self._is_valid_base64_image_str(source_str):
+            if is_valid_base64_image_str(source_str):
                 b64 = _extract_base64_only(source_str) if force_b64 else source_str
                 if b64:
                     conversion_cache[img_source] = b64
@@ -968,7 +946,7 @@ class GeminiImageGenerationPlugin(Star):
 
             # QQ 图床优先转 base64，避免直链失效
             if parsed_host and "qpic.cn" in parsed_host:
-                qq_data = await self._download_qq_image(source_str)
+                qq_data = await download_qq_image_with_headers(source_str)
                 if qq_data:
                     if force_b64 and ";base64," in qq_data:
                         qq_data = qq_data.split(";base64,", 1)[1]
@@ -1118,14 +1096,14 @@ class GeminiImageGenerationPlugin(Star):
         self,
         event: AstrMessageEvent,
         prompt: str,
-        reference_images: list[str],
-        avatar_reference: list[str],
-    ) -> tuple[bool, tuple[list[str], list[str], str | None, str | None] | str]:
+        reference_images: list[ImageUrl],
+        avatar_reference: list[ImageUrl],
+    ) -> tuple[bool, ImageGenerationResult | str]:
         """
         内部核心图像生成方法，不发送消息，只返回结果
 
         Returns:
-            tuple[bool, tuple[list[str], list[str], str | None, str | None] | str]:
+            tuple[bool, ImageGenerationResult | str]:
             (是否成功, (图片URL列表, 图片路径列表, 文本内容, 思维签名) 或错误消息)
         """
         if not self._ensure_api_client():
@@ -1275,20 +1253,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return False, error_msg
 
         except APIError as e:
-            status_part = (
-                f"（状态码 {e.status_code}）" if e.status_code is not None else ""
-            )
-            error_msg = f"❌ 图像生成失败{status_part}：{e.message}"
-            if e.status_code == 429:
-                error_msg += "\n🧐 可能原因：请求过于频繁或额度已用完。\n✅ 建议：稍等片刻再试，或在配置中增加可用额度/开启智能重试。"
-            elif e.status_code == 402:
-                error_msg += "\n🧐 可能原因：账户余额不足或套餐到期。\n✅ 建议：充值或更换一组可用的 API 密钥后再试。"
-            elif e.status_code == 403:
-                error_msg += "\n🧐 可能原因：API 密钥无效、权限不足或访问受限。\n✅ 建议：核对密钥权限、检查 IP 白名单，必要时重新生成密钥。"
-            elif e.status_code and 500 <= e.status_code < 600:
-                error_msg += "\n🧐 可能原因：上游服务暂时不可用。\n✅ 建议：稍后重试，若频繁出现请联系服务提供方确认故障。"
-            else:
-                error_msg += "\n🧐 可能原因：请求参数异常或服务返回未知错误。\n✅ 建议：简化提示词/减少参考图后重试，并查看日志获取更多细节。"
+            error_msg = self._build_api_error_message(e)
             logger.error(error_msg)
             return False, error_msg
 
@@ -2099,7 +2064,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         else:
             try:
                 # 2) base64/data URL
-                if isinstance(src, str) and self._is_valid_base64_image_str(src):
+                if isinstance(src, str) and is_valid_base64_image_str(src):
                     b64_data = src
                     if ";base64," in src:
                         _, _, b64_data = src.partition(";base64,")
@@ -2109,7 +2074,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     local_path = str(tmp_path)
                 # 3) URL 下载（含 qpic/nt.qq 直链）
                 elif isinstance(src, str) and src.startswith(("http://", "https://")):
-                    data_url = await self._download_qq_image(src)
+                    data_url = await download_qq_image_with_headers(src)
                     if not data_url and self.api_client:
                         mime_type, b64 = await self.api_client._normalize_image_input(
                             src, image_input_mode=self.image_input_mode
@@ -2121,7 +2086,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                                 else f"data:{mime_type};base64,{b64}"
                             )
 
-                    if data_url and self._is_valid_base64_image_str(data_url):
+                    if data_url and is_valid_base64_image_str(data_url):
                         b64_data = data_url
                         if ";base64," in data_url:
                             _, _, b64_data = data_url.partition(";base64,")

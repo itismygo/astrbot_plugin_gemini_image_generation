@@ -1016,6 +1016,52 @@ class AvatarManager:
         await self.cleanup_cache()
 
 
+async def download_qq_image_with_headers(url: str) -> str | None:
+    """对QQ图床做特殊处理，补充Referer/UA后转为base64
+
+    Args:
+        url: QQ图床URL
+
+    Returns:
+        data URL格式的base64数据，失败返回None
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Connection": "keep-alive",
+        }
+        if parsed.netloc:
+            headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
+        if "qpic.cn" in (parsed.netloc or ""):
+            headers["Referer"] = "https://qun.qq.com"
+
+        timeout = aiohttp.ClientTimeout(total=12, connect=5)
+        async with aiohttp.ClientSession(headers=headers, trust_env=True) as session:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        f"QQ图片下载失败: HTTP {resp.status} {resp.reason} | {url[:80]}"
+                    )
+                    return None
+                data = await resp.read()
+                if not data:
+                    logger.warning(f"QQ图片为空: {url[:80]}")
+                    return None
+                mime = resp.headers.get("Content-Type", "image/jpeg")
+                if ";" in mime:
+                    mime = mime.split(";", 1)[0]
+                base64_data = base64.b64encode(data).decode("utf-8")
+                return f"data:{mime};base64,{base64_data}"
+    except Exception as e:
+        logger.warning(f"QQ图片下载异常: {e} | {url[:80]}")
+        return None
+
+
 # 为了向后兼容，提供一些旧名称的别名
 def download_qq_avatar_legacy(user_id: str, cache_name: str, event=None) -> str | None:
     """
