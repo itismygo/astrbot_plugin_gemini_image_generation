@@ -1,8 +1,8 @@
-# AstrBot Gemini 图像生成插件 v1.6.6
+# AstrBot Gemini 图像生成插件 v1.6.7
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/Version-v1.6.6-blue)
+![Version](https://img.shields.io/badge/Version-v1.6.7-blue)
 ![License](https://img.shields.io/badge/License-MIT-orange)
 
 </div>
