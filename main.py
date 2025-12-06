@@ -7,11 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import json
 import os
 import re
-import shutil
 import time
 import urllib.parse
 from datetime import datetime
@@ -25,8 +22,7 @@ from PIL import Image as PILImage
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.event.filter import EventMessageType
-from astrbot.api.message_components import At, File, Image, Record, Reply, Video
+from astrbot.api.message_components import At, Image, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import ProviderType
@@ -93,157 +89,6 @@ class GeminiImageGenerationPlugin(Star):
         # 启动定时清理任务
         self._start_cleanup_task()
 
-        # 初始化图片缓存目录
-        self._init_sticker_cache()
-
-    def _init_sticker_cache(self):
-        """初始化表情包/图片缓存目录"""
-        from .tl.tl_utils import get_plugin_data_dir
-        self.sticker_cache_dir = get_plugin_data_dir() / "sticker_cache"
-        self.sticker_cache_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"表情包缓存目录: {self.sticker_cache_dir}")
-
-    def _get_sticker_cache_dir(self) -> Path:
-        """获取表情包缓存目录"""
-        if not hasattr(self, 'sticker_cache_dir') or not self.sticker_cache_dir:
-            self._init_sticker_cache()
-        return self.sticker_cache_dir
-
-    def _save_url_index(self, url: str, file_path: str):
-        """保存 URL 到文件路径的映射索引"""
-        try:
-            cache_dir = self._get_sticker_cache_dir()
-            index_file = cache_dir / ".url_index.json"
-
-            url_hash = hashlib.md5(url.encode()).hexdigest()
-
-            index = {}
-            if index_file.exists():
-                try:
-                    with open(index_file, "r", encoding="utf-8") as f:
-                        index = json.load(f)
-                except Exception:
-                    index = {}
-
-            index[url_hash] = {
-                "url": url,
-                "path": file_path,
-                "time": datetime.now().isoformat()
-            }
-
-            # 清理超过 1000 条的旧记录
-            if len(index) > 1000:
-                sorted_items = sorted(index.items(), key=lambda x: x[1].get("time", ""), reverse=True)
-                index = dict(sorted_items[:800])
-
-            with open(index_file, "w", encoding="utf-8") as f:
-                json.dump(index, f, ensure_ascii=False, indent=2)
-
-            logger.debug(f"已保存 URL 索引: {url[:50]}... -> {file_path}")
-
-        except Exception as e:
-            logger.debug(f"保存 URL 索引失败: {e}")
-
-    async def _save_image_from_component(self, component, origin: str = "消息") -> str | None:
-        """从消息组件保存图片到本地缓存，返回本地文件路径"""
-        try:
-            cache_dir = self._get_sticker_cache_dir()
-            file_url = None
-            file_path_local = None
-            default_ext = ".png"
-
-            # 获取 URL
-            if isinstance(component, Image):
-                file_url = getattr(component, "url", None)
-                default_ext = ".jpg"
-            elif isinstance(component, File):
-                file_url = getattr(component, "url", None)
-            elif isinstance(component, Video):
-                file_url = getattr(component, "url", None)
-                default_ext = ".mp4"
-            elif isinstance(component, Record):
-                file_url = getattr(component, "url", None)
-                default_ext = ".wav"
-
-            # 尝试通过 get_file() 获取本地路径
-            if hasattr(component, "get_file") and callable(getattr(component, "get_file")):
-                try:
-                    file_path_local = await component.get_file()
-                except Exception as e:
-                    logger.debug(f"get_file() 失败({origin}): {e}")
-
-            # 尝试通过 convert_to_file_path() 获取本地路径
-            if not file_path_local and isinstance(component, Image) and hasattr(component, "convert_to_file_path"):
-                try:
-                    file_path_local = await component.convert_to_file_path()
-                except Exception as e:
-                    logger.debug(f"convert_to_file_path() 失败({origin}): {e}")
-
-            if not file_url and not file_path_local:
-                return None
-
-            # 生成保存文件名
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            ext = default_ext
-            if file_url:
-                # 尝试从 URL 获取扩展名
-                parsed = urllib.parse.urlparse(file_url)
-                path_ext = os.path.splitext(parsed.path)[1]
-                if path_ext and path_ext.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
-                    ext = path_ext.lower()
-
-            save_name = f"sticker_{timestamp}{ext}"
-            save_path = cache_dir / save_name
-
-            # 优先从本地复制
-            if file_path_local and os.path.exists(file_path_local):
-                if os.path.islink(file_path_local):
-                    logger.warning(f"拒绝复制符号链接: {file_path_local}")
-                    return None
-                shutil.copy2(file_path_local, save_path)
-                logger.info(f"图片已保存(本地复制)({origin}): {save_path}")
-                # 记录 URL 映射
-                if file_url:
-                    self._save_url_index(file_url, str(save_path))
-                return str(save_path)
-
-            # 从 URL 下载
-            if file_url:
-                try:
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    headers = {
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
-                        ),
-                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                    }
-                    # QQ 图床特殊处理
-                    parsed = urllib.parse.urlparse(file_url)
-                    if "qpic.cn" in (parsed.netloc or ""):
-                        headers["Referer"] = "https://qun.qq.com"
-
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.get(file_url, headers=headers) as response:
-                            if response.status == 200:
-                                content = await response.read()
-                                with open(save_path, "wb") as f:
-                                    f.write(content)
-                                logger.info(f"图片已保存(URL下载)({origin}): {save_path}")
-                                # 记录 URL 映射
-                                self._save_url_index(file_url, str(save_path))
-                                return str(save_path)
-                            else:
-                                logger.warning(f"下载图片失败，状态码: {response.status}")
-                except Exception as e:
-                    logger.warning(f"下载图片失败({origin}): {e}")
-
-            return None
-
-        except Exception as e:
-            logger.error(f"保存图片失败({origin}): {e}")
-            return None
-
     def _start_cleanup_task(self):
         """启动定时清理任务"""
         if self._cleanup_task and not self._cleanup_task.done():
@@ -290,53 +135,6 @@ class GeminiImageGenerationPlugin(Star):
         except Exception as e:
             logger.warning(f"获取 tool_call_timeout 配置失败: {e}，使用默认值 60 秒")
             return 60
-
-    async def _find_image_from_local_index(
-        self, url: str, event: AstrMessageEvent = None
-    ) -> str | None:
-        """
-        通过 URL 从插件本地索引中查找已保存的本地文件
-
-        Args:
-            url: 图片的 URL
-            event: 消息事件（可选，保留兼容性）
-
-        Returns:
-            本地文件路径，如果未找到则返回 None
-        """
-        try:
-            cache_dir = self._get_sticker_cache_dir()
-            index_file = cache_dir / ".url_index.json"
-
-            if not index_file.exists():
-                return None
-
-            url_hash = hashlib.md5(url.encode()).hexdigest()
-
-            try:
-                with open(index_file, "r", encoding="utf-8") as f:
-                    index = json.load(f)
-
-                if url_hash in index:
-                    file_path = index[url_hash].get("path")
-                    if file_path and os.path.exists(file_path):
-                        logger.info(f"从本地索引找到图片: {url[:50]}... -> {file_path}")
-                        return file_path
-            except Exception as e:
-                self.log_debug(f"读取本地索引失败: {e}")
-
-            return None
-
-        except Exception as e:
-            self.log_debug(f"查找本地图片索引失败: {e}")
-            return None
-
-    # 保留旧方法名作为别名，兼容已有代码
-    async def _find_image_from_workspace_index(
-        self, url: str, event: AstrMessageEvent
-    ) -> str | None:
-        """兼容旧方法名，实际调用本地索引查找"""
-        return await self._find_image_from_local_index(url, event)
 
     async def get_avatar_reference(self, event: AstrMessageEvent) -> list[str]:
         """获取头像作为参考图像，支持群头像和用户头像（直接HTTP下载）"""
@@ -1186,27 +984,6 @@ class GeminiImageGenerationPlugin(Star):
                 conversion_cache[img_source] = source_str
                 return source_str
 
-            # 检测本地文件路径，直接读取并转为 base64
-            if os.path.exists(source_str) and os.path.isfile(source_str):
-                try:
-                    from .tl.tl_utils import encode_file_to_base64
-                    import mimetypes
-
-                    mime_type, _ = mimetypes.guess_type(source_str)
-                    if not mime_type or not mime_type.startswith("image/"):
-                        mime_type = "image/png"
-
-                    base64_data = encode_file_to_base64(source_str)
-                    if force_b64:
-                        result = base64_data
-                    else:
-                        result = f"data:{mime_type};base64,{base64_data}"
-                    conversion_cache[img_source] = result
-                    logger.info(f"本地文件转换成功({origin}): {source_str}")
-                    return result
-                except Exception as e:
-                    logger.warning(f"本地文件转换失败({origin}): {e}")
-
             # 强制 base64 模式
             if image_mode == "force_base64":
                 return await to_data_url(source_str)
@@ -1224,68 +1001,16 @@ class GeminiImageGenerationPlugin(Star):
                 return
 
             img_source = None
-            component_url = getattr(component, "url", None)
-
-            # 方案1: 尝试从工作空间插件的 URL 索引中查找已保存的本地文件
-            if component_url:
-                logger.info(f"[图片获取] 尝试从工作空间索引查找: {component_url[:60]}...")
-                local_from_workspace = await self._find_image_from_workspace_index(
-                    component_url, event
-                )
-                if local_from_workspace:
-                    img_source = local_from_workspace
-                    logger.info(f"[图片获取] 从工作空间索引找到本地文件({origin}): {local_from_workspace}")
-                else:
-                    logger.info(f"[图片获取] 工作空间索引未找到匹配")
-
-            # 方案2: 尝试 convert_to_file_path() 获取图片本地路径
-            if not img_source and isinstance(component, Image) and hasattr(component, "convert_to_file_path"):
-                try:
-                    local_path = await component.convert_to_file_path()
-                    if local_path and os.path.exists(local_path):
-                        from .tl.tl_utils import get_plugin_data_dir
-                        import shutil
-                        cache_dir = get_plugin_data_dir() / "images" / "ref_cache"
-                        cache_dir.mkdir(parents=True, exist_ok=True)
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                        ext = os.path.splitext(local_path)[1] or ".png"
-                        cached_file = cache_dir / f"ref_{timestamp}{ext}"
-                        shutil.copy2(local_path, cached_file)
-                        img_source = str(cached_file)
-                        self.log_debug(f"通过 convert_to_file_path() 获取并缓存图片({origin}): {local_path} -> {cached_file}")
-                except Exception as e:
-                    self.log_debug(f"convert_to_file_path() 失败({origin}): {e}")
-
-            # 方案3: 尝试 get_file()
-            if not img_source and hasattr(component, "get_file") and callable(getattr(component, "get_file")):
-                try:
-                    local_path = await component.get_file()
-                    if local_path and os.path.exists(local_path):
-                        from .tl.tl_utils import get_plugin_data_dir
-                        import shutil
-                        cache_dir = get_plugin_data_dir() / "images" / "ref_cache"
-                        cache_dir.mkdir(parents=True, exist_ok=True)
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                        ext = os.path.splitext(local_path)[1] or ".png"
-                        cached_file = cache_dir / f"ref_{timestamp}{ext}"
-                        shutil.copy2(local_path, cached_file)
-                        img_source = str(cached_file)
-                        self.log_debug(f"通过 get_file() 获取并缓存图片({origin}): {local_path} -> {cached_file}")
-                except Exception as e:
-                    self.log_debug(f"get_file() 失败({origin}): {e}")
-
-            # 方案4: 回退到原有逻辑，从 url 或 file 属性获取
-            if not img_source:
-                if isinstance(component, Image):
-                    if getattr(component, "url", None):
-                        img_source = component.url
-                    elif getattr(component, "file", None):
-                        img_source = component.file
-                else:
-                    if getattr(component, "url", None):
-                        img_source = component.url
-                    elif getattr(component, "file", None):
-                        img_source = component.file
+            if isinstance(component, Image):
+                if getattr(component, "url", None):
+                    img_source = component.url
+                elif getattr(component, "file", None):
+                    img_source = component.file
+            else:
+                if getattr(component, "url", None):
+                    img_source = component.url
+                elif getattr(component, "file", None):
+                    img_source = component.file
 
             if not img_source:
                 return
@@ -2011,48 +1736,6 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         """快速模式指令组"""
         pass
 
-    @quick_mode_group.command("调试引用")
-    async def debug_reply_image(self, event: AstrMessageEvent):
-        """调试引用消息中的图片信息"""
-        result_lines = ["=== 调试引用消息图片 ==="]
-
-        try:
-            message_chain = event.get_messages()
-        except Exception:
-            message_chain = getattr(event.message_obj, "message", []) or []
-
-        result_lines.append(f"消息链长度: {len(message_chain)}")
-
-        for i, component in enumerate(message_chain):
-            comp_type = type(component).__name__
-            result_lines.append(f"\n[{i}] 类型: {comp_type}")
-
-            if comp_type == "Reply":
-                result_lines.append(f"  Reply.id: {getattr(component, 'id', 'N/A')}")
-                result_lines.append(f"  Reply.chain: {component.chain if hasattr(component, 'chain') else 'N/A'}")
-                if hasattr(component, 'chain') and component.chain:
-                    for j, reply_comp in enumerate(component.chain):
-                        reply_type = type(reply_comp).__name__
-                        result_lines.append(f"    [{j}] 类型: {reply_type}")
-                        if reply_type == "Image":
-                            url = getattr(reply_comp, 'url', 'N/A')
-                            file = getattr(reply_comp, 'file', 'N/A')
-                            result_lines.append(f"      url: {url[:100] if url else 'None'}...")
-                            result_lines.append(f"      file: {file[:100] if file else 'None'}...")
-
-                            # 测试 URL 索引查找
-                            if url:
-                                local_path = await self._find_image_from_workspace_index(url, event)
-                                result_lines.append(f"      索引查找结果: {local_path or '未找到'}")
-
-            elif comp_type == "Image":
-                url = getattr(component, 'url', 'N/A')
-                file = getattr(component, 'file', 'N/A')
-                result_lines.append(f"  url: {url[:100] if url else 'None'}...")
-                result_lines.append(f"  file: {file[:100] if file else 'None'}...")
-
-        yield event.plain_result("\n".join(result_lines))
-
     @quick_mode_group.command("头像")
     async def quick_avatar(self, event: AstrMessageEvent, prompt: str):
         """头像快速模式 - 1K分辨率，1:1比例"""
@@ -2121,86 +1804,6 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             skip_figure_enhance=True,
         ):
             yield result
-
-    @quick_mode_group.command("测试本地图")
-    async def quick_test_local_image(self, event: AstrMessageEvent, file_path: str = "", prompt: str = ""):
-        """测试本地图片生成表情包 - 用于调试
-
-        用法: -快速 测试本地图 <文件路径> [提示词]
-        示例: -快速 测试本地图 /AstrBot/data/xxx/image.jpg 开心的表情
-        """
-        if not file_path:
-            yield event.plain_result(
-                "❌ 请提供本地文件路径\n"
-                "用法: -快速 测试本地图 <文件路径> [提示词]\n"
-                "示例: -快速 测试本地图 /AstrBot/data/xxx/image.jpg"
-            )
-            return
-
-        # 检查文件是否存在
-        if not os.path.exists(file_path):
-            yield event.plain_result(f"❌ 文件不存在: {file_path}")
-            return
-
-        yield event.plain_result(f"🎨 使用本地图片测试表情包生成...\n📁 文件: {file_path}")
-
-        # 将本地文件转为 base64
-        try:
-            from .tl.tl_utils import encode_file_to_base64
-            import mimetypes
-
-            mime_type, _ = mimetypes.guess_type(file_path)
-            if not mime_type:
-                mime_type = "image/png"
-
-            base64_data = encode_file_to_base64(file_path)
-            reference_images = [f"data:{mime_type};base64,{base64_data}"]
-
-            self.log_debug(f"本地图片已转换为 base64，大小: {len(base64_data)} 字符")
-        except Exception as e:
-            yield event.plain_result(f"❌ 读取本地图片失败: {e}")
-            return
-
-        # 使用表情包提示词
-        user_prompt = prompt.strip() if prompt else ""
-        full_prompt = get_sticker_prompt(user_prompt)
-
-        old_resolution = self.resolution
-        old_aspect_ratio = self.aspect_ratio
-
-        try:
-            self.resolution = "4K"
-            self.aspect_ratio = "16:9"
-
-            success, result_data = await self._generate_image_core_internal(
-                event=event,
-                prompt=full_prompt,
-                reference_images=reference_images,
-                avatar_reference=[],
-            )
-
-            if not success or not isinstance(result_data, tuple):
-                error_msg = (
-                    f"{result_data}"
-                    if isinstance(result_data, str)
-                    else "❌ 表情包生成未成功"
-                )
-                yield event.plain_result(error_msg)
-                return
-
-            image_urls, image_paths, text_content, thought_signature = result_data
-
-            # 发送生成的图片
-            for img_path in image_paths:
-                if img_path and Path(img_path).exists():
-                    yield event.image_result(img_path)
-
-            if text_content:
-                yield event.plain_result(text_content)
-
-        finally:
-            self.resolution = old_resolution
-            self.aspect_ratio = old_aspect_ratio
 
     @quick_mode_group.command("表情包")
     async def quick_sticker(self, event: AstrMessageEvent, prompt: str = ""):
@@ -2417,19 +2020,69 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 pass
 
     @filter.command("切图")
-    async def split_image_command(self, event: AstrMessageEvent):
-        """对消息中的图片进行智能切割，自动识别 2x2 网格"""
-        logger.info("[切图] 开始处理切图指令")
-        use_black_line_cutter = True
+    async def split_image_command(self, event: AstrMessageEvent, grid: str | None = None):
+        """对消息中的图片进行切割；支持手动指定网格，例如“切图 46”表示横4列竖6行；支持“切图 黑线”使用黑线分割"""
+        manual_cols: int | None = None
+        manual_rows: int | None = None
+        use_black_line_cutter = True  # 默认启用黑线分割算法
+        
+        # 优先尝试从原始消息提取完整文本，因为 grid 参数可能会被空格截断（例如 "6 4" 变成 "6"）
+        raw_grid_text = ""
+        try:
+            raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", "")
+            if isinstance(raw_msg, str):
+                raw_grid_text = raw_msg
+            elif isinstance(raw_msg, dict):
+                raw_grid_text = str(raw_msg.get("message", "")) or str(raw_msg)
+        except Exception:
+            pass
 
-        logger.info(f"[切图] 开始获取图片，use_black_line_cutter={use_black_line_cutter}")
+        # 如果 raw_message 中包含指令，优先使用它
+        if "切图" in raw_grid_text:
+            grid_text = raw_grid_text
+        else:
+            # 否则回退到 grid 参数
+            grid_text = grid or raw_grid_text or ""
+
+        def _parse_manual_grid(text: str) -> tuple[int | None, int | None]:
+            """只解析紧跟在“切图”指令后的数字，支持 4 4 / 44 / 4x4 格式"""
+            cleaned = text or ""
+            cmd_pos = cleaned.find("切图")
+            if cmd_pos != -1:
+                cleaned = cleaned[cmd_pos + len("切图") :]
+            cleaned = re.sub(r"\\[CQ:[^\\]]+\\]", " ", cleaned)
+            cleaned = cleaned.replace("[图片]", " ")
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            m = re.match(r"^(\d{1,2})\s*[xX*]\s*(\d{1,2})", cleaned)
+            if not m:
+                m = re.match(r"^(\d{1,2})\s+(\d{1,2})", cleaned)
+            
+            if m:
+                # 修改输入习惯：第一个数字是行(Rows)，第二个数字是列(Cols)
+                # 例如 "6 4" 或 "6x4" -> 6行4列
+                r, c = int(m.group(1)), int(m.group(2))
+                if c > 0 and r > 0:
+                    return c, r
+            return None, None
+
+        if grid_text:
+            try:
+                # 检测是否要求黑线分割
+                if "黑线" in grid_text:
+                    use_black_line_cutter = True
+
+                manual_cols, manual_rows = _parse_manual_grid(grid_text)
+
+                if manual_cols is None or manual_rows is None:
+                    if grid_text.strip():
+                        logger.debug(f"未能解析切图网格参数: {grid_text}")
+            except Exception as e:
+                logger.debug(f"切图网格参数处理异常: {e}")
+
         ref_images, _ = await self._fetch_images_from_event(
             event, include_at_avatars=False
         )
-        logger.info(f"[切图] 获取到 {len(ref_images)} 张图片")
-
         if not ref_images:
-            logger.warning("[切图] 未找到可切割的图片")
             yield event.plain_result(
                 "❌ 未找到可切割的图片。\n"
                 "🧐 可能原因：消息中未包含图片、引用消息或合并转发内无图片。\n"
@@ -2438,22 +2091,15 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return
 
         src = ref_images[0]
-        logger.info(f"[切图] 图片源类型: {type(src).__name__}, 内容前100字符: {str(src)[:100]}...")
         local_path = None
 
-        # 1) 已有本地文件（排除 data URL 和 http URL）
-        if isinstance(src, str) and not src.startswith(("data:", "http://", "https://")) and len(src) < 1000:
-            try:
-                if Path(src).exists():
-                    local_path = src
-                    logger.info(f"[切图] 使用本地文件: {local_path}")
-            except OSError as e:
-                logger.debug(f"[切图] 检查本地文件路径失败: {e}")
+        # 1) 已有本地文件
+        if isinstance(src, str) and Path(src).exists():
+            local_path = src
         else:
             try:
                 # 2) base64/data URL
                 if isinstance(src, str) and self._is_valid_base64_image_str(src):
-                    logger.info("[切图] 检测到 base64/data URL，开始解码...")
                     b64_data = src
                     if ";base64," in src:
                         _, _, b64_data = src.partition(";base64,")
@@ -2461,19 +2107,13 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                     tmp_path.write_bytes(data)
                     local_path = str(tmp_path)
-                    logger.info(f"[切图] base64 解码成功，保存到: {local_path}")
                 # 3) URL 下载（含 qpic/nt.qq 直链）
                 elif isinstance(src, str) and src.startswith(("http://", "https://")):
-                    logger.info(f"[切图] 检测到 URL，开始下载: {src[:80]}...")
                     data_url = await self._download_qq_image(src)
-                    logger.info(f"[切图] _download_qq_image 结果: {'成功' if data_url else '失败'}")
-
                     if not data_url and self.api_client:
-                        logger.info("[切图] 尝试使用 api_client._normalize_image_input...")
                         mime_type, b64 = await self.api_client._normalize_image_input(
                             src, image_input_mode=self.image_input_mode
                         )
-                        logger.info(f"[切图] _normalize_image_input 结果: mime={mime_type}, b64={'有数据' if b64 else '无数据'}")
                         if b64:
                             data_url = (
                                 b64
@@ -2489,22 +2129,16 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                         tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                         tmp_path.write_bytes(data)
                         local_path = str(tmp_path)
-                        logger.info(f"[切图] URL 下载成功，保存到: {local_path}")
-                    else:
-                        logger.warning(f"[切图] URL 下载失败或数据无效")
                 # 4) 其他字符串尝试当作 base64
                 elif isinstance(src, str):
-                    logger.info("[切图] 尝试将字符串当作 base64 解码...")
                     data = base64.b64decode(src)
                     tmp_path = Path("/tmp") / f"cut_{int(time.time() * 1000)}.png"
                     tmp_path.write_bytes(data)
                     local_path = str(tmp_path)
-                    logger.info(f"[切图] base64 解码成功，保存到: {local_path}")
             except Exception as e:
-                logger.warning(f"切图解析图片失败: {e}", exc_info=True)
+                logger.warning(f"切图解析图片失败: {e}")
 
         if not local_path:
-            logger.error("[切图] 无法获取本地图片路径")
             yield event.plain_result(
                 "❌ 图片下载/解析失败，无法进行切割。\n"
                 "🧐 可能原因：图片链接失效、群文件无权限或格式不受支持。\n"
@@ -2512,36 +2146,55 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             )
             return
 
-        logger.info(f"[切图] 本地图片路径: {local_path}")
+        ai_rows: int | None = None
+        ai_cols: int | None = None
+        ai_detected = False
+        # 如果启用了黑线分割（默认启用），则跳过 AI 识别，优先尝试算法
+        if not (manual_cols and manual_rows) and self.vision_provider_id and not use_black_line_cutter:
+            ai_res = await self._detect_grid_rows_cols(local_path)
+            if ai_res:
+                ai_rows, ai_cols = ai_res
+                ai_detected = True
 
-        yield event.plain_result("✂️ 正在智能切割 2x2 网格图片...")
-
-        logger.info(f"[切图] 开始调用 split_image: local_path={local_path}, use_black_line_cutter={use_black_line_cutter}")
+        # if manual_cols and manual_rows:
+        #     if use_black_line_cutter:
+        #          yield event.plain_result(f"✂️ 尝试使用黑线算法按 {manual_cols}x{manual_rows} 切割...")
+        #     else:
+        #          yield event.plain_result(f"✂️ 按 {manual_cols}x{manual_rows} 网格切割图片...")
+        # elif ai_detected and ai_rows and ai_cols:
+        #     yield event.plain_result(
+        #         f"🤖 AI 识别到 {ai_cols}x{ai_rows} 网格，优先切割..."
+        #     )
+        # elif not use_black_line_cutter:
+        #     tip = "✂️ 正在切割图片..."
+        #     if grid:
+        #         tip += "（网格参数未解析，已使用智能切割）"
+        #     yield event.plain_result(tip)
 
         split_files: list[str] = []
         try:
             split_files = await asyncio.to_thread(
                 split_image,
                 local_path,
-                rows=2,
-                cols=2,
+                rows=6,
+                cols=4,
+                manual_rows=manual_rows,
+                manual_cols=manual_cols,
+                ai_rows=ai_rows,
+                ai_cols=ai_cols,
                 use_black_line_cutter=use_black_line_cutter,
             )
-            logger.info(f"[切图] split_image 返回 {len(split_files)} 个文件")
         except Exception as e:
-            logger.error(f"切割图片时发生异常: {e}", exc_info=True)
+            logger.error(f"切割图片时发生异常: {e}")
             split_files = []
 
         if not split_files:
-            logger.error("[切图] 切割失败，未生成有效切片")
             yield event.plain_result(
                 "❌ 图片切割失败，未生成有效切片。\n"
                 "🧐 可能原因：图片格式/尺寸异常，或切割依赖缺失。\n"
                 "✅ 建议：尝试更换图片或检查依赖后重试。"
             )
             return
-
-        logger.info(f"[切图] 切割成功，生成 {len(split_files)} 个切片: {split_files[:3]}...")
 
         from astrbot.api.message_components import Image as AstrImage
         from astrbot.api.message_components import Node, Plain
@@ -2907,30 +2560,3 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return comps
 
         return [Comp.Plain(str(result_data))]
-
-    # ==================== 图片自动保存监听器 ====================
-
-    @filter.event_message_type(EventMessageType.ALL)
-    async def on_message_auto_save_images(self, event: AstrMessageEvent):
-        """
-        监听所有消息，自动保存图片到本地缓存并建立 URL 索引。
-        这样在后续生图时可以通过 URL 反查到本地文件，解决 QQ 表情包等特殊图片无法直接获取的问题。
-        """
-        try:
-            message = event.message_obj
-            if not message or not hasattr(message, "message"):
-                return
-
-            for component in message.message:
-                # 只处理图片类型
-                if isinstance(component, Image):
-                    # 异步保存，不阻塞消息处理
-                    asyncio.create_task(self._save_image_from_component(component, "自动保存"))
-                elif isinstance(component, Reply) and hasattr(component, "chain") and component.chain:
-                    # 处理引用消息中的图片
-                    for reply_comp in component.chain:
-                        if isinstance(reply_comp, Image):
-                            asyncio.create_task(self._save_image_from_component(reply_comp, "引用消息自动保存"))
-
-        except Exception as e:
-            logger.debug(f"自动保存图片监听器异常: {e}")

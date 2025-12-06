@@ -965,20 +965,6 @@ def split_image(
             if boxes:
                 logger.debug(f"使用外部提供的裁剪框，共 {len(boxes)} 个")
 
-        # 手动切割优先级：外部裁剪框 > 手动指定 > AI > 智能切分
-        if not boxes and manual_rows and manual_cols:
-            boxes = generate_manual_boxes(manual_rows, manual_cols)
-            if boxes:
-                logger.debug(f"使用手动网格裁剪: {manual_cols} x {manual_rows}")
-
-        # AI 行列切割（可选），在没有手动网格时尝试
-        if not boxes and ai_rows and ai_cols and ai_rows > 0 and ai_cols > 0:
-            ai_files = ai_split_with_rows_cols(
-                image_path, ai_rows, ai_cols, final_output_dir, base_name, img
-            )
-            if ai_files:
-                return ai_files
-
         def run_black_line_cutter(debug: bool = True):
             """执行黑色分割线切割"""
             nonlocal sticker_crops, sticker_debug
@@ -986,15 +972,28 @@ def split_image(
                 from .sticker_cutter import BlackLineCutter
                 # 新版 BlackLineCutter 不需要 stroke_size
                 cutter = BlackLineCutter()
-                sticker_crops, sticker_debug = cutter.process_image(img, debug=debug)
+                # 默认 2x2，如果指定了 manual_rows/cols 则使用指定值
+                target_rows = manual_rows if manual_rows else 2
+                target_cols = manual_cols if manual_cols else 2
+                
+                sticker_crops, sticker_debug = cutter.process_image(img, rows=target_rows, cols=target_cols, debug=debug)
                 if sticker_crops:
-                    logger.debug(f"使用黑色分割线切割，共 {len(sticker_crops)} 个裁剪结果")
+                    logger.debug(f"使用黑色分割线切割 ({target_cols}x{target_rows})，共 {len(sticker_crops)} 个裁剪结果")
             except Exception as e:
                 logger.debug(f"黑色分割线切割失败: {e}")
                 sticker_crops = None
 
+        # 优先级调整：如果启用了黑线切割，优先尝试黑线切割（即使有 manual_rows/cols）
+        # 只有当黑线切割失败（返回 None 或空列表）时，才回退到简单的手动网格切割
         if not boxes and use_black_line_cutter:
             run_black_line_cutter(debug=True)
+
+        # 手动切割优先级：外部裁剪框 > 黑线切割 > 手动指定 > AI > 智能切分
+        # 如果黑线切割成功，sticker_crops 会有值，这里就不会执行
+        if not boxes and not sticker_crops and manual_rows and manual_cols:
+            boxes = generate_manual_boxes(manual_rows, manual_cols)
+            if boxes:
+                logger.debug(f"黑线切割未生效，回退使用手动网格裁剪: {manual_cols} x {manual_rows}")
 
         # 如果没有外部裁剪框或手动网格，且没有黑线切割结果，则使用 SmartMemeSplitter 进行智能切分
         if not boxes and not sticker_crops:
