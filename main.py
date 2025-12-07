@@ -2059,8 +2059,18 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         src = ref_images[0]
         local_path = None
 
+        # 辅助函数：判断是否可能是本地文件路径（排除 base64/URL）
+        def _is_possible_local_path(s: str) -> bool:
+            if not isinstance(s, str):
+                return False
+            if s.startswith(("http://", "https://", "data:")):
+                return False
+            if len(s) > 1000:  # 路径不会这么长，避免 OSError
+                return False
+            return True
+
         # 1) 已有本地文件
-        if isinstance(src, str) and Path(src).exists():
+        if _is_possible_local_path(src) and Path(src).exists():
             local_path = src
         else:
             try:
