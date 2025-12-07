@@ -1778,6 +1778,11 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         功能受配置文件控制：
         - enable_sticker_split: 是否自动切割图片
         - enable_sticker_zip: 是否打包发送（如果发送失败则使用合并转发）
+        
+        支持自定义网格：
+        - "表情包 3 3" 表示3行3列（9个表情）
+        - 不指定则默认3x3网格
+        - "表情包 简单 3 3" 使用英文提示词
         """
         allowed, limit_message = await self._check_and_consume_limit(event)
         if not allowed:
@@ -1785,16 +1790,35 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 yield event.plain_result(limit_message)
             return
 
-        yield event.plain_result("🎨 使用表情包模式生成图像...")
+        # 解析网格参数和简单模式
+        grid_rows = 3  # 默认3行
+        grid_cols = 3  # 默认3列
+        user_prompt = (prompt or "").strip()
+        simple_mode = False
+        
+        # 检查是否为简单模式
+        if user_prompt.startswith("简单"):
+            simple_mode = True
+            user_prompt = user_prompt[len("简单"):].strip()
+        
+        # 尝试从 prompt 中解析网格参数（格式：数字 数字）
+        grid_match = re.match(r'^(\d{1,2})\s+(\d{1,2})(?:\s+(.*))?$', user_prompt)
+        if grid_match:
+            grid_rows = int(grid_match.group(1))
+            grid_cols = int(grid_match.group(2))
+            user_prompt = (grid_match.group(3) or "").strip()
+            # 限制网格范围
+            grid_rows = max(1, min(grid_rows, 10))
+            grid_cols = max(1, min(grid_cols, 10))
+
+        total_stickers = grid_rows * grid_cols
+        mode_hint = "简单模式，" if simple_mode else ""
+        yield event.plain_result(f"🎨 使用表情包模式生成图像（{mode_hint}{grid_rows}x{grid_cols} 网格，共 {total_stickers} 个表情）...")
 
         use_avatar = await self.should_use_avatar(event)
         reference_images, avatar_reference = await self._fetch_images_from_event(
             event, include_at_avatars=use_avatar
         )
-
-        stripped_prompt = (prompt or "").strip()
-        simple_mode = stripped_prompt.startswith("简单")
-        user_prompt = stripped_prompt[len("简单") :].strip() if simple_mode else prompt
 
         if not reference_images:
             yield event.plain_result(
@@ -1804,13 +1828,15 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             )
             return
 
+        # 生成提示词
+        full_prompt = (
+            get_q_version_sticker_prompt(user_prompt, rows=grid_rows, cols=grid_cols)
+            if simple_mode
+            else get_sticker_prompt(user_prompt, rows=grid_rows, cols=grid_cols)
+        )
+
         # 如果没有开启切割功能，直接使用默认逻辑
         if not self.enable_sticker_split:
-            full_prompt = (
-                get_q_version_sticker_prompt(user_prompt)
-                if simple_mode
-                else get_sticker_prompt(user_prompt)
-            )
             old_resolution = self.resolution
             old_aspect_ratio = self.aspect_ratio
 
@@ -1827,11 +1853,6 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             return
 
         # 开启了切割功能，执行自定义逻辑
-        full_prompt = (
-            get_q_version_sticker_prompt(user_prompt)
-            if simple_mode
-            else get_sticker_prompt(user_prompt)
-        )
         old_resolution = self.resolution
         old_aspect_ratio = self.aspect_ratio
 
@@ -1890,8 +1911,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                 if ai_res:
                     ai_rows, ai_cols = ai_res
 
-            # 1. 切割图片
-            yield event.plain_result("✂️ 正在切割图片...")
+            # 1. 切割图片 - 使用用户指定的网格参数
+            yield event.plain_result(f"✂️ 正在按 {grid_rows}x{grid_cols} 网格切割图片...")
             try:
                 # 优先尝试视觉识别裁剪，失败则回退网格裁剪
                 split_files: list[str] = []
@@ -1901,8 +1922,10 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     split_files = await asyncio.to_thread(
                         split_image,
                         primary_image_path,
-                        rows=6,
-                        cols=4,
+                        rows=grid_rows,
+                        cols=grid_cols,
+                        manual_rows=grid_rows,
+                        manual_cols=grid_cols,
                         ai_rows=ai_rows,
                         ai_cols=ai_cols,
                         use_black_line_cutter=True,
@@ -1960,7 +1983,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     node_content.append(AstrImage.fromFileSystem(primary_image_path))
                 except Exception:
                     pass
-                node_content.append(Plain("表情包切片："))
+                node_content.append(Plain(f"表情包切片（{grid_rows}x{grid_cols} 网格，共 {len(split_files)} 个）："))
 
                 for file_path in split_files:
                     try:

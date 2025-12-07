@@ -52,13 +52,23 @@ def get_mobile_prompt(prompt: str) -> str:
     return base_prompt
 
 
-def get_sticker_prompt(prompt: str = "") -> str:
-    """获取表情包提示词"""
-    base_prompt = """为我生成图中角色的Q版风格，LINE 风格的半身像表情包，注意头饰要正确
-彩色手绘风格，严格按照2x2网格布局均匀分布（共4个表情）。
+def get_sticker_prompt(prompt: str = "", rows: int = 3, cols: int = 3) -> str:
+    """获取表情包提示词
+    
+    Args:
+        prompt: 用户附加要求
+        rows: 网格行数，默认3
+        cols: 网格列数，默认3
+    """
+    total = rows * cols
+    base_prompt = f"""为我生成图中角色的Q版风格，LINE 风格的半身像表情包，注意头饰要正确
+彩色手绘风格，严格按照{rows}x{cols}网格布局均匀分布（共{total}个表情）。
 
-【重要】分割线要求：
-- 用黑色直线将4个表情包分割开，构成标准的"田"字格。
+【重要】分割线要求（必须严格遵守）：
+- 必须使用纯黑色直线(#000000)将{total}个表情包严格分隔开
+- 画{rows - 1}条水平黑线和{cols - 1}条垂直黑线，构成标准的{rows}x{cols}网格
+- 黑色分割线必须贯穿整个画面，不要断裂，线宽约2-4像素
+- 分割线颜色必须是纯黑色，不要使用灰色或其他颜色
 
 每个表情格子内是白色背景，涵盖各种常见于聊天群的meme表情。
 其他需求：不要原图复制，高清修复，高质量。不要添加文字。
@@ -180,10 +190,24 @@ def enhance_prompt_for_figure(prompt: str) -> str:
     return get_figure_prompt(prompt, style_type=1)
 
 
-def get_q_version_sticker_prompt(prompt: str = "") -> str:
-    """英文版Q版表情包提示词"""
-    base_prompt = """Generate a Q version drawing of the characters in the image, in LINE style, with half-body expressions, ensuring the headgear is correct.
-Color hand-drawn style, strictly following a 4*4 layout evenly distributed, with a white background, covering a variety of commonly used chat phrases or some related entertainment memes.
+def get_q_version_sticker_prompt(prompt: str = "", rows: int = 3, cols: int = 3) -> str:
+    """英文版Q版表情包提示词
+    
+    Args:
+        prompt: 用户附加要求
+        rows: 网格行数，默认3
+        cols: 网格列数，默认3
+    """
+    total = rows * cols
+    base_prompt = f"""Generate a Q version drawing of the characters in the image, in LINE style, with half-body expressions, ensuring the headgear is correct.
+Color hand-drawn style, strictly following a {rows}x{cols} grid layout evenly distributed (total {total} expressions), with a white background, covering a variety of commonly used chat phrases or some related entertainment memes.
+
+【IMPORTANT】Grid separator requirements (must strictly follow):
+- Use pure black lines (#000000) to separate the {total} expressions
+- Draw {rows - 1} horizontal black lines and {cols - 1} vertical black lines to form a standard {rows}x{cols} grid
+- Black separator lines must span the entire image without breaks, line width about 2-4 pixels
+- Separator line color must be pure black, do not use gray or other colors
+
 Other requirements: Do not copy the original image, high-definition restoration, high quality. All annotations should be simple symbols or in English."""
 
     if prompt.strip():
