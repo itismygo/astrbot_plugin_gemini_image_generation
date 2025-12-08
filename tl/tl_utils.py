@@ -221,19 +221,29 @@ async def cleanup_old_images(images_dir: Path | None = None):
             for pattern in image_patterns:
                 for file_path in images_dir.glob(pattern):
                     try:
-                        if datetime.fromtimestamp(file_path.stat().st_mtime) < cutoff_time:
+                        if (
+                            datetime.fromtimestamp(file_path.stat().st_mtime)
+                            < cutoff_time
+                        ):
                             file_path.unlink()
                             cleaned_count += 1
                     except Exception as e:
                         logger.warning(f"清理文件 {file_path} 时出错: {e}")
 
         # 清理 download_cache 目录
-        cache_dir = images_dir / "download_cache" if images_dir else plugin_data_dir / "images" / "download_cache"
+        cache_dir = (
+            images_dir / "download_cache"
+            if images_dir
+            else plugin_data_dir / "images" / "download_cache"
+        )
         if cache_dir.exists():
             for file_path in cache_dir.glob("*"):
                 if file_path.is_file():
                     try:
-                        if datetime.fromtimestamp(file_path.stat().st_mtime) < cutoff_time:
+                        if (
+                            datetime.fromtimestamp(file_path.stat().st_mtime)
+                            < cutoff_time
+                        ):
                             file_path.unlink()
                             cleaned_count += 1
                     except Exception as e:
@@ -245,7 +255,10 @@ async def cleanup_old_images(images_dir: Path | None = None):
             for file_path in split_dir.glob("*"):
                 if file_path.is_file():
                     try:
-                        if datetime.fromtimestamp(file_path.stat().st_mtime) < cutoff_time:
+                        if (
+                            datetime.fromtimestamp(file_path.stat().st_mtime)
+                            < cutoff_time
+                        ):
                             file_path.unlink()
                             cleaned_count += 1
                     except Exception as e:

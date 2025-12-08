@@ -784,6 +784,8 @@ class GeminiAPIClient:
             "max_tokens": config.max_tokens,
             "temperature": 0.7,
             "modalities": ["image", "text"],
+            # 明确关闭流式响应，避免部分 OpenAI 兼容服务默认返回 SSE
+            "stream": False,
         }
 
         # image_config 与 Gemini 3 Pro Image 模型相关的配置
@@ -1071,16 +1073,33 @@ class GeminiAPIClient:
         ) as response:
             logger.debug(f"响应状态: {response.status}")
             response_text = await response.text()
+            content_type = response.headers.get("Content-Type", "") or ""
 
             # 解析 JSON 响应，添加错误处理
             try:
                 response_data = json.loads(response_text) if response_text else {}
             except json.JSONDecodeError as e:
-                logger.error(f"JSON 解析失败: {e}")
-                logger.error(f"响应内容前500字符: {response_text[:500]}")
-                raise APIError(
-                    f"API 返回了无效的 JSON 响应: {e}", response.status
-                ) from None
+                # SSE 响应（text/event-stream）需要额外解析
+                if (
+                    "text/event-stream" in content_type.lower()
+                    or response_text.strip().startswith("data:")
+                ):
+                    try:
+                        response_data = self._parse_sse_payload(response_text)
+                        logger.debug("检测到 SSE 响应，已完成 JSON 转换")
+                    except Exception as sse_error:
+                        logger.error(f"SSE 解析失败: {sse_error}")
+                        logger.error(f"响应内容前500字符: {response_text[:500]}")
+                        raise APIError(
+                            f"API 返回了无效的 JSON/SSE 响应: {sse_error}",
+                            response.status,
+                        ) from None
+                else:
+                    logger.error(f"JSON 解析失败: {e}")
+                    logger.error(f"响应内容前500字符: {response_text[:500]}")
+                    raise APIError(
+                        f"API 返回了无效的 JSON 响应: {e}", response.status
+                    ) from None
 
             if response.status == 200:
                 logger.debug("API 调用成功")
@@ -1100,6 +1119,68 @@ class GeminiAPIClient:
                 )
                 logger.warning(f"API 错误: {error_msg}")
                 raise APIError(error_msg, response.status)
+
+    def _parse_sse_payload(self, raw_text: str) -> dict[str, Any]:
+        """解析 text/event-stream 响应，提取最后一个包含有效 payload 的 data 包"""
+
+        events: list[dict[str, Any]] = []
+        data_lines: list[str] = []
+
+        def flush_event():
+            """将累计的 data 行拼接并解析为一个事件"""
+            if not data_lines:
+                return
+            data_text = "\n".join(data_lines).strip()
+            data_lines.clear()
+            if not data_text or data_text == "[DONE]":
+                return
+            try:
+                parsed = json.loads(data_text)
+                if isinstance(parsed, dict):
+                    events.append(parsed)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "SSE 事件解析失败: %s | 片段: %s",
+                    e,
+                    data_text[:160],
+                )
+
+        for raw_line in raw_text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                flush_event()
+                continue
+            if stripped.startswith(":"):
+                # SSE 注释行，直接跳过
+                continue
+            if stripped.startswith("data:"):
+                data_lines.append(stripped.removeprefix("data:").lstrip())
+                continue
+
+            # 少数实现会省略前缀，这里尝试兼容
+            if stripped and stripped != "[DONE]":
+                data_lines.append(stripped)
+
+        flush_event()
+
+        if not events:
+            raise ValueError(
+                f"SSE 响应中未找到有效的 data 事件 (收到 {len(raw_text)} 字符, 片段: {raw_text[:160]!r})"
+            )
+
+        # 优先返回含 candidates/choices/data 字段的事件，避免 STOP 包覆盖有效负载
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("candidates") or event.get("choices") or event.get("data"):
+                logger.debug(
+                    "SSE 响应共解析 %s 个事件，返回含有效负载的末尾事件",
+                    len(events),
+                )
+                return event
+
+        logger.debug("SSE 响应只包含通用事件，返回最后一个 data 包")
+        return events[-1]
 
     async def _parse_gresponse(
         self, response_data: dict, session: aiohttp.ClientSession

@@ -2284,7 +2284,11 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         ai_rows: int | None = None
         ai_cols: int | None = None
         ai_detected = False
-        if not (manual_cols and manual_rows) and not use_sticker_cutter and self.vision_provider_id:
+        if (
+            not (manual_cols and manual_rows)
+            and not use_sticker_cutter
+            and self.vision_provider_id
+        ):
             ai_res = await self._detect_grid_rows_cols(local_path)
             if ai_res:
                 ai_rows, ai_cols = ai_res
