@@ -1358,13 +1358,23 @@ class GeminiAPIClient:
         image_paths: list[str] = []
         text_content = None
         thought_signature = None
+        fail_reasons: list[str] = []
 
-        if "choices" in response_data:
+        message: dict[str, Any] | None = None
+        if "choices" in response_data and response_data["choices"]:
             choice = response_data["choices"][0]
             message = choice.get("message", {})
+        else:
+            message = self._coerce_basic_openai_message(response_data)
+
+        if message:
+            if "choices" not in response_data:
+                logger.debug(
+                    "[FLOW_DEBUG][openai] 使用非标准字段构造 message，keys=%s",
+                    list(response_data.keys())[:5],
+                )
             content = message.get("content", "")
 
-            fail_reasons: list[str] = []
             text_chunks: list[str] = []
             image_candidates: list[str] = []
             extracted_urls: list[str] = []
@@ -1396,7 +1406,7 @@ class GeminiAPIClient:
                 extracted_urls.extend(self._find_image_urls_in_text(content))
 
             # 标准 images 字段（兼容 Gemini/OpenAI 混合格式）
-            if "images" in message and message["images"]:
+            if message.get("images"):
                 for image_item in message["images"]:
                     if not isinstance(image_item, dict):
                         continue
@@ -1497,8 +1507,13 @@ class GeminiAPIClient:
                             len(b64_clean),
                         )
 
+        else:
+            logger.debug(
+                "[FLOW_DEBUG][openai] 响应缺少可用的 message 字段，尝试 data/b64 解析"
+            )
+
         # OpenAI 格式
-        elif "data" in response_data and response_data["data"]:
+        if not image_urls and not image_paths and response_data.get("data"):
             for image_item in response_data["data"]:
                 if "url" in image_item:
                     image_url, image_path = await self._download_image(
@@ -1542,6 +1557,75 @@ class GeminiAPIClient:
 
         logger.warning("OpenAI 响应格式不支持或未找到图像数据")
         return image_urls, image_paths, text_content, thought_signature
+
+    def _normalize_message_value(self, raw_value: Any) -> dict[str, Any] | None:
+        """归一化任意常见字段为标准 message 结构"""
+        if raw_value is None:
+            return None
+
+        if isinstance(raw_value, dict):
+            if raw_value.get("role") and "content" in raw_value:
+                return raw_value
+
+            if "message" in raw_value:
+                nested = self._normalize_message_value(raw_value.get("message"))
+                if nested:
+                    return nested
+
+            for key in ("content", "text", "output", "result", "response"):
+                if key in raw_value:
+                    nested = self._normalize_message_value(raw_value.get(key))
+                    if nested:
+                        return nested
+
+            return None
+
+        if isinstance(raw_value, list):
+            if raw_value:
+                return {"role": "assistant", "content": raw_value}
+            return None
+
+        if isinstance(raw_value, str):
+            cleaned = raw_value.strip()
+            if cleaned:
+                return {"role": "assistant", "content": cleaned}
+            return None
+
+        return None
+
+    def _coerce_basic_openai_message(
+        self, response_data: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """从常见兼容格式提取 message，兼容 body/content/text 等字段"""
+
+        primary_keys = [
+            "message",
+            "content",
+            "text",
+            "output",
+            "result",
+            "response",
+        ]
+        nested_keys = [
+            "body",
+            "modelOutput",
+            "model_output",
+            "response_body",
+        ]
+
+        for key in primary_keys:
+            normalized = self._normalize_message_value(response_data.get(key))
+            if normalized:
+                return normalized
+
+        for key in nested_keys:
+            value = response_data.get(key)
+            if isinstance(value, (dict, list, str)):
+                normalized = self._normalize_message_value(value)
+                if normalized:
+                    return normalized
+
+        return None
 
     async def _parse_data_uri(self, data_uri: str) -> tuple[str | None, str | None]:
         """解析 data URI 格式的图像"""
