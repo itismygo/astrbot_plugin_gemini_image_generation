@@ -275,6 +275,39 @@ class GeminiImageGenerationPlugin(Star):
         # 只有当有@用户时才获取头像
         return len(mentioned_users) > 0
 
+    def _prompt_contains_avatar_keywords(self, prompt: str) -> bool:
+        """检查提示词中是否包含头像相关关键词"""
+        if not prompt:
+            return False
+        prompt_lower = prompt.lower()
+        avatar_keywords = [
+            "头像", "按照我", "根据我", "基于我", "参考我", "我的",
+            "avatar", "my face", "my photo", "像我", "本人",
+        ]
+        return any(kw in prompt_lower for kw in avatar_keywords)
+
+    async def should_use_avatar_for_prompt(self, event: AstrMessageEvent, prompt: str) -> bool:
+        """
+        根据提示词判断是否应该使用头像作为参考
+        只有当提示词明确包含头像相关关键词或有@用户时才获取头像
+        """
+        if not self.auto_avatar_reference:
+            return False
+
+        # 检查是否有@用户
+        mentioned_users = await self.parse_mentions(event)
+        if mentioned_users:
+            logger.info(f"检测到@用户，启用头像参考: {len(mentioned_users)} 人")
+            return True
+
+        # 检查提示词是否包含头像关键词
+        if self._prompt_contains_avatar_keywords(prompt):
+            logger.info(f"提示词包含头像关键词，启用头像参考")
+            return True
+
+        logger.info("提示词不含头像关键词且无@用户，跳过头像获取")
+        return False
+
     async def parse_mentions(self, event: AstrMessageEvent) -> list[int]:
         """解析消息中的@用户，返回用户ID列表"""
         mentioned_users = []
@@ -1855,7 +1888,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             else:
                 full_prompt = prompt
 
-            use_avatar = await self.should_use_avatar(event)
+            # 只有提示词包含头像关键词或有@用户时才获取头像
+            use_avatar = await self.should_use_avatar_for_prompt(event, prompt)
 
             async for result in self._quick_generate_image(
                 event, full_prompt, use_avatar, **kwargs
@@ -2550,7 +2584,9 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         full_prompt = get_style_change_prompt(style, prompt)
 
-        use_avatar = await self.should_use_avatar(event)
+        # 只有提示词包含头像关键词或有@用户时才获取头像
+        combined_prompt = f"{style} {prompt}".strip()
+        use_avatar = await self.should_use_avatar_for_prompt(event, combined_prompt)
         reference_images, avatar_reference = await self._fetch_images_from_event(
             event, include_at_avatars=use_avatar
         )
