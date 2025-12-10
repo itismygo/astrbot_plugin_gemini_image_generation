@@ -111,6 +111,10 @@ class ApiRequestConfig:
     seed: int | None = None  # 固定种子以确保一致性
     safety_settings: dict | None = None  # 安全设置
 
+    # 自定义 API 参数名（支持不同 API 的字段命名差异）
+    resolution_param_name: str = "image_size"  # 分辨率参数名
+    aspect_ratio_param_name: str = "aspect_ratio"  # 长宽比参数名
+
 
 class APIError(Exception):
     """API 错误基类"""
@@ -381,41 +385,33 @@ class GeminiAPIClient:
 
         image_config = {}
 
+        # 获取自定义参数名（支持不同 API 的命名差异）
+        resolution_key = (config.resolution_param_name or "image_size").strip()
+        aspect_ratio_key = (config.aspect_ratio_param_name or "aspect_ratio").strip()
+
         # 根据官方文档设置图像尺寸
         if config.resolution:
             resolution = config.resolution.upper()
 
-            if resolution in ["1K", "1024x1024"]:
-                image_config["image_size"] = "1K"
-                logger.debug("设置图像尺寸: 1K")
-            elif resolution in ["2K", "2048x2048"]:
-                image_config["image_size"] = "2K"
-                logger.debug("设置图像尺寸: 2K")
-            elif resolution in ["4K", "4096x4096"]:
-                image_config["image_size"] = "4K"
-                logger.debug("设置图像尺寸: 4K")
+            if resolution in ["1K", "1024X1024"]:
+                image_config[resolution_key] = "1K"
+                logger.debug(f"设置图像尺寸: 1K (参数名: {resolution_key})")
+            elif resolution in ["2K", "2048X2048"]:
+                image_config[resolution_key] = "2K"
+                logger.debug(f"设置图像尺寸: 2K (参数名: {resolution_key})")
+            elif resolution in ["4K", "4096X4096"]:
+                image_config[resolution_key] = "4K"
+                logger.debug(f"设置图像尺寸: 4K (参数名: {resolution_key})")
             else:
-                # 默认使用1K
-                image_config["image_size"] = "1K"
-                logger.warning(f"不支持的分辨率: {config.resolution}，使用默认尺寸 1K")
+                # 自定义分辨率值，直接透传
+                image_config[resolution_key] = config.resolution
+                logger.debug(f"设置图像尺寸: {config.resolution} (参数名: {resolution_key})")
 
-        # 设置长宽比
-        if config.aspect_ratio and ":" in config.aspect_ratio:
-            # 将长宽比转换为标准格式
-            ratio_map = {
-                "1:1": "1:1",
-                "16:9": "16:9",
-                "9:16": "9:16",
-                "3:2": "3:2",
-                "4:3": "4:3",
-            }
-            ratio = ratio_map.get(config.aspect_ratio, config.aspect_ratio)
-            image_config["aspect_ratio"] = ratio
-            logger.debug(f"设置长宽比: {ratio}")
-        elif config.aspect_ratio:
-            logger.warning(
-                f"不支持的长宽比格式: {config.aspect_ratio}，将使用默认长宽比"
-            )
+        # 设置长宽比（支持任意自定义比例）
+        if config.aspect_ratio:
+            ratio = config.aspect_ratio.strip()
+            image_config[aspect_ratio_key] = ratio
+            logger.debug(f"设置长宽比: {ratio} (参数名: {aspect_ratio_key})")
 
         if image_config:
             generation_config["image_config"] = image_config

@@ -112,6 +112,18 @@
         "type": "bool",
         "hint": "启用后，无论模型名称是什么，都强制传递 image_size 参数给 API。如果使用非 gemini-3-pro-image-preview 模型但支持分辨率参数，请开启此选项。",
         "default": false
+      },
+      "resolution_param_name": {
+        "description": "分辨率参数名",
+        "type": "string",
+        "hint": "API 请求中分辨率参数的字段名，不同 API 可能使用不同名称（如 image_size、size、resolution 等）。留空使用默认值 image_size",
+        "default": "image_size"
+      },
+      "aspect_ratio_param_name": {
+        "description": "长宽比参数名",
+        "type": "string",
+        "hint": "API 请求中长宽比参数的字段名，不同 API 可能使用不同名称（如 aspect_ratio、aspectRatio、image_aspect_ratio 等）。留空使用默认值 aspect_ratio",
+        "default": "aspect_ratio"
       }
     }
   },

@@ -1,8 +1,8 @@
-# AstrBot Gemini 图像生成插件 v1.6.9
+# AstrBot Gemini 图像生成插件 v1.7.0
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/Version-v1.6.9-blue)
+![Version](https://img.shields.io/badge/Version-v1.7.0-blue)
 ![License](https://img.shields.io/badge/License-MIT-orange)
 
 </div>
@@ -105,7 +105,7 @@
 
 **image_generation_settings**
 - `resolution`：生成图像分辨率，默认 `1K`（可选 1K/2K/4K）。
-- `aspect_ratio`：长宽比，默认 `1:1`（常用比例已列出）。
+- `aspect_ratio`：长宽比，默认 `1:1`。
 - `enable_sticker_split`：表情包切分，默认 true。
 - `enable_sticker_zip`：切分后是否打包 ZIP 发送，默认 false。
 - `preserve_reference_image_size`：改图/换风格时尽量保留参考图尺寸，默认 false。
@@ -113,6 +113,8 @@
 - `max_reference_images`：参考图最大数量，默认 6。
 - `enable_text_response`：是否同时返回文本说明，默认 false。
 - `force_resolution`：强制传 `image_size` 参数给模型，默认 false。
+- `resolution_param_name`：**自定义分辨率参数名**，不同 API 可能使用不同字段名（如 `image_size`、`size`、`resolution`），默认 `image_size`。
+- `aspect_ratio_param_name`：**自定义长宽比参数名**，不同 API 可能使用不同字段名（如 `aspect_ratio`、`aspectRatio`、`image_aspect_ratio`），默认 `aspect_ratio`。
 
 **retry_settings**
 - `max_attempts_per_key`：每个密钥的最大重试次数，默认 3。

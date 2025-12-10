@@ -148,7 +148,7 @@ class GeminiImageGenerationPlugin(Star):
             return 60
 
     async def get_avatar_reference(self, event: AstrMessageEvent) -> list[str]:
-        """获取头像作为参考图像，支持群头像和用户头像（直接HTTP下载）"""
+        """获取头像作为参考图像，支持用户头像（直接HTTP下载）"""
         avatar_images = []
         download_tasks = []
 
@@ -331,6 +331,9 @@ class GeminiImageGenerationPlugin(Star):
         self.enable_llm_crop = image_settings.get("enable_llm_crop", True)
         # 从配置中读取强制分辨率设置，默认为False
         self.force_resolution = image_settings.get("force_resolution", False)
+        # 自定义 API 参数名（支持不同 API 的命名差异）
+        self.resolution_param_name = image_settings.get("resolution_param_name", "image_size") or "image_size"
+        self.aspect_ratio_param_name = image_settings.get("aspect_ratio_param_name", "aspect_ratio") or "aspect_ratio"
         # 参考图传输统一使用 base64，移除格式可选项
         self.image_input_mode = "force_base64"
 
@@ -1241,11 +1244,11 @@ class GeminiImageGenerationPlugin(Star):
             avatar_images = avatar_images[:remaining_slots]
 
         if message_images or avatar_images:
-            logger.debug(
+            logger.info(
                 f"已收集图片: 消息 {len(message_images)} 张，头像 {len(avatar_images)} 张"
             )
         else:
-            logger.debug("未收集到有效参考图片，若需参考图可直接发送图片或检查网络权限")
+            logger.info("未收集到有效参考图片，若需参考图可直接发送图片或检查网络权限")
 
         return message_images, avatar_images
 
@@ -1313,6 +1316,8 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             force_resolution=self.force_resolution,
             verbose_logging=self.verbose_logging,
             image_input_mode=self.image_input_mode,
+            resolution_param_name=self.resolution_param_name,
+            aspect_ratio_param_name=self.aspect_ratio_param_name,
         )
 
         logger.info("🎨 图像生成请求:")
