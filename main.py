@@ -302,7 +302,7 @@ class GeminiImageGenerationPlugin(Star):
 
         # 检查提示词是否包含头像关键词
         if self._prompt_contains_avatar_keywords(prompt):
-            logger.info(f"提示词包含头像关键词，启用头像参考")
+            logger.info("提示词包含头像关键词，启用头像参考")
             return True
 
         logger.info("提示词不含头像关键词且无@用户，跳过头像获取")
