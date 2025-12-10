@@ -111,6 +111,10 @@ class ApiRequestConfig:
     seed: int | None = None  # 固定种子以确保一致性
     safety_settings: dict | None = None  # 安全设置
 
+    # 自定义 API 参数名（支持不同 API 的字段命名差异）
+    resolution_param_name: str = "image_size"  # 分辨率参数名
+    aspect_ratio_param_name: str = "aspect_ratio"  # 长宽比参数名
+
 
 class APIError(Exception):
     """API 错误基类"""
@@ -257,90 +261,67 @@ class GeminiAPIClient:
         added_refs = 0
         fail_reasons: list[str] = []
         if config.reference_images:
-            for image_input in config.reference_images[:14]:
+            for idx, image_input in enumerate(config.reference_images[:14]):
+                image_str = str(image_input).strip()
                 logger.debug(
                     "[google] 处理参考图 idx=%s type=%s preview=%s",
-                    added_refs,
+                    idx,
                     type(image_input),
-                    str(image_input)[:120],
+                    image_str[:120],
                 )
-                # 优先尝试解析为本地文件（包含缓存文件），再转 base64；为避免复用旧缓存，使用临时目录
-                data = None
-                mime_type = None
-                local_path: str | None = None
-                try:
-                    local_path = await resolve_image_source_to_path(
-                        image_input,
-                        image_input_mode=config.image_input_mode,
-                        api_client=self,
-                        download_qq_image_fn=download_qq_image,
-                    )
-                    if local_path and Path(local_path).exists():
-                        suffix = Path(local_path).suffix.lower().lstrip(".") or "png"
-                        mime_type = f"image/{suffix}"
-                        data = encode_file_to_base64(local_path)
-                except Exception:
-                    local_path = None
-                    data = None
-                    mime_type = None
+
+                # 使用统一的参考图处理方法
+                mime_type, data, is_url = await self._process_reference_image(
+                    image_input, idx, config.image_input_mode
+                )
 
                 if not data:
-                    # 统一转换为受支持的 base64，避免直链不可达/格式不确定
-                    temp_cache = Path(
-                        tempfile.mkdtemp(prefix="gemini_ref_tmp_", dir="/tmp")
-                    )
-                    mime_type, data = await GeminiAPIClient._normalize_image_input(
-                        image_input,
-                        image_input_mode=config.image_input_mode,
-                        image_cache_dir=temp_cache,
-                    )
-                if not data and isinstance(image_input, str):
-                    # 再尝试通过 QQ 下载器直接获取 data URL
-                    try:
-                        qq_data = await download_qq_image(str(image_input))
-                        if qq_data:
-                            if ";base64," in qq_data:
-                                mime_type = qq_data.split(";", 1)[0].replace(
-                                    "data:", ""
-                                )
-                                _, _, raw_b64 = qq_data.partition(";base64,")
-                                data = raw_b64
-                            else:
-                                data = qq_data
-                    except Exception:
-                        pass
-                if not data:
-                    # 最终兜底：直接使用原始字符串交给 API，避免在插件侧拦截
-                    data = str(image_input).strip()
-                    mime_type = mime_type or "image/png"
+                    # 转换失败处理
+                    if is_url:
+                        # URL 下载失败，改用 fileData 格式传输
+                        parts.append({"fileData": {"fileUri": image_str}})
+                        added_refs += 1
+                        logger.info(
+                            "[google] URL 下载失败，改用 fileData 传输 idx=%s url=%s",
+                            idx,
+                            image_str[:80],
+                        )
+                        continue
+                    else:
+                        # 非 URL 输入，直接透传原始数据
+                        data = image_str
+                        mime_type = self._ensure_mime_type(mime_type)
+                        logger.debug(
+                            "[google] 转换失败，直接透传原始数据 idx=%s preview=%s",
+                            idx,
+                            image_str[:80],
+                        )
 
-                # 严格校验 base64，避免传入无效数据导致 inline_data 解码错误
-                try:
-                    data = GeminiAPIClient._validate_and_normalize_b64(
-                        data, context="google-inline", allow_relaxed_return=True
+                # 校验 base64，失败则透传或回退 URL
+                validated_data, is_valid = self._validate_b64_with_fallback(
+                    data, context="google-inline"
+                )
+
+                if not is_valid and is_url:
+                    # URL 转换的数据校验失败，改用 fileData
+                    parts.append({"fileData": {"fileUri": image_str}})
+                    added_refs += 1
+                    logger.info(
+                        "[google] base64 校验失败，改用 fileData 传输 idx=%s url=%s",
+                        idx,
+                        image_str[:80],
                     )
-                except APIError as e:
-                    # 如果验证失败，直接使用原始/去前缀的 base64 透传，避免在插件侧拦截
-                    raw = str(data).strip()
-                    if ";base64," in raw:
-                        _, _, raw = raw.partition(";base64,")
-                    data = raw
-                    logger.debug(
-                        "跳过 base64 校验，直接透传参考图: %s... | %s",
-                        str(image_input)[:80],
-                        e.message,
-                    )
-                    fail_reasons.append(
-                        f"idx={added_refs} base64校验失败已透传 | {e.message}"
-                    )
+                    continue
+
+                mime_type = self._ensure_mime_type(mime_type)
                 logger.debug(
                     "[google] 成功处理参考图 idx=%s mime=%s size=%s",
-                    added_refs,
+                    idx,
                     mime_type,
-                    len(str(data)) if data else 0,
+                    len(validated_data) if validated_data else 0,
                 )
 
-                parts.append({"inlineData": {"mimeType": mime_type, "data": data}})
+                parts.append({"inlineData": {"mimeType": mime_type, "data": validated_data}})
                 added_refs += 1
 
         if config.reference_images and added_refs == 0:
@@ -381,41 +362,36 @@ class GeminiAPIClient:
 
         image_config = {}
 
+        # 获取自定义参数名（支持不同 API 的命名差异）
+        # 先 strip 再检查是否为空，避免空格字符串导致空键
+        _res_key = (config.resolution_param_name or "").strip()
+        resolution_key = _res_key if _res_key else "image_size"
+        _aspect_key = (config.aspect_ratio_param_name or "").strip()
+        aspect_ratio_key = _aspect_key if _aspect_key else "aspect_ratio"
+
         # 根据官方文档设置图像尺寸
         if config.resolution:
             resolution = config.resolution.upper()
 
-            if resolution in ["1K", "1024x1024"]:
-                image_config["image_size"] = "1K"
-                logger.debug("设置图像尺寸: 1K")
-            elif resolution in ["2K", "2048x2048"]:
-                image_config["image_size"] = "2K"
-                logger.debug("设置图像尺寸: 2K")
-            elif resolution in ["4K", "4096x4096"]:
-                image_config["image_size"] = "4K"
-                logger.debug("设置图像尺寸: 4K")
+            if resolution in ["1K", "1024X1024"]:
+                image_config[resolution_key] = "1K"
+                logger.debug(f"设置图像尺寸: 1K (参数名: {resolution_key})")
+            elif resolution in ["2K", "2048X2048"]:
+                image_config[resolution_key] = "2K"
+                logger.debug(f"设置图像尺寸: 2K (参数名: {resolution_key})")
+            elif resolution in ["4K", "4096X4096"]:
+                image_config[resolution_key] = "4K"
+                logger.debug(f"设置图像尺寸: 4K (参数名: {resolution_key})")
             else:
-                # 默认使用1K
-                image_config["image_size"] = "1K"
-                logger.warning(f"不支持的分辨率: {config.resolution}，使用默认尺寸 1K")
+                # 自定义分辨率值，直接透传
+                image_config[resolution_key] = config.resolution
+                logger.debug(f"设置图像尺寸: {config.resolution} (参数名: {resolution_key})")
 
-        # 设置长宽比
-        if config.aspect_ratio and ":" in config.aspect_ratio:
-            # 将长宽比转换为标准格式
-            ratio_map = {
-                "1:1": "1:1",
-                "16:9": "16:9",
-                "9:16": "9:16",
-                "3:2": "3:2",
-                "4:3": "4:3",
-            }
-            ratio = ratio_map.get(config.aspect_ratio, config.aspect_ratio)
-            image_config["aspect_ratio"] = ratio
-            logger.debug(f"设置长宽比: {ratio}")
-        elif config.aspect_ratio:
-            logger.warning(
-                f"不支持的长宽比格式: {config.aspect_ratio}，将使用默认长宽比"
-            )
+        # 设置长宽比（支持任意自定义比例）
+        if config.aspect_ratio:
+            ratio = config.aspect_ratio.strip()
+            image_config[aspect_ratio_key] = ratio
+            logger.debug(f"设置长宽比: {ratio} (参数名: {aspect_ratio_key})")
 
         if image_config:
             generation_config["image_config"] = image_config
@@ -462,46 +438,14 @@ class GeminiAPIClient:
 
         force_b64 = True
 
-        def _ensure_valid_base64(data: str, context: str):
-            try:
-                cleaned = data.strip().replace("\n", "")
-                if ";base64," in cleaned:
-                    _, _, cleaned = cleaned.partition(";base64,")
-                base64.b64decode(cleaned, validate=True)
-            except Exception:
-                raise APIError(
-                    f"参考图 base64 校验失败（force_base64），来源: {context}",
-                    None,
-                    "invalid_reference_image",
-                )
-
         added_refs = 0
         fail_reasons: list[str] = []
         if config.reference_images:
             # 本地缓存避免重复处理同一引用图，记录耗时便于性能观察
             processed_cache: dict[str, dict[str, Any]] = {}
-            supported_exts = {
-                "jpg",
-                "jpeg",
-                "png",
-                "webp",
-                "gif",
-                "bmp",
-                "tif",
-                "tiff",
-                "heic",
-                "avif",
-            }
             total_start = time.perf_counter()
 
             for idx, image_input in enumerate(config.reference_images[:6]):
-                logger.debug(
-                    "[openai] 处理参考图 idx=%s type=%s preview=%s",
-                    idx,
-                    type(image_input),
-                    str(image_input)[:120],
-                )
-                per_start = time.perf_counter()
                 image_str = str(image_input).strip()
                 if not image_str:
                     logger.warning(f"跳过空白参考图像: idx={idx}")
@@ -510,222 +454,77 @@ class GeminiAPIClient:
                 if "&amp;" in image_str:
                     image_str = image_str.replace("&amp;", "&")
 
-                # 命中缓存直接复用，避免重复 base64 处理
+                logger.debug(
+                    "[openai] 处理参考图 idx=%s type=%s preview=%s",
+                    idx,
+                    type(image_input),
+                    image_str[:120],
+                )
+                per_start = time.perf_counter()
+
+                # 命中缓存直接复用
                 if image_str in processed_cache:
                     logger.debug(f"参考图像命中缓存: idx={idx}")
                     message_content.append(processed_cache[image_str])
+                    added_refs += 1
                     continue
 
-                parsed = urllib.parse.urlparse(image_str)
                 image_payload: dict[str, Any] | None = None
+                is_url = image_str.startswith(("http://", "https://"))
 
                 try:
-                    # http(s) URL：优先用缓存/本地文件，再规范化为 base64
-                    if parsed.scheme in ("http", "https") and parsed.netloc:
-                        data = None
-                        mime_type = None
-                        local_path: str | None = None
-                        try:
-                            local_path = await resolve_image_source_to_path(
-                                image_input,
-                                image_input_mode=config.image_input_mode,
-                                api_client=None,
-                                download_qq_image_fn=download_qq_image,
-                            )
-                            if local_path and Path(local_path).exists():
-                                suffix = (
-                                    Path(local_path).suffix.lower().lstrip(".") or "png"
-                                )
-                                mime_type = f"image/{suffix}"
-                                data = encode_file_to_base64(local_path)
-                        except Exception:
-                            local_path = None
-                            data = None
-                            mime_type = None
+                    # 使用统一的参考图处理方法
+                    mime_type, data, _ = await GeminiAPIClient()._process_reference_image(
+                        image_input, idx, config.image_input_mode
+                    )
 
-                        if not data:
-                            temp_cache = Path(
-                                tempfile.mkdtemp(prefix="gemini_ref_tmp_", dir="/tmp")
-                            )
-                            (
-                                mime_type,
-                                data,
-                            ) = await GeminiAPIClient._normalize_image_input(
-                                image_input,
-                                image_input_mode=config.image_input_mode,
-                                image_cache_dir=temp_cache,
-                            )
-                        if not data and isinstance(image_input, str):
-                            try:
-                                qq_data = await download_qq_image(str(image_input))
-                                if qq_data:
-                                    if ";base64," in qq_data:
-                                        mime_type = qq_data.split(";", 1)[0].replace(
-                                            "data:", ""
-                                        )
-                                        _, _, raw_b64 = qq_data.partition(";base64,")
-                                        data = raw_b64
-                                    else:
-                                        data = qq_data
-                            except Exception:
-                                pass
-                        if not data:
-                            # 最终兜底：直接使用原始字符串交给 API，避免在插件侧拦截
-                            data = str(image_input).strip()
-                            mime_type = mime_type or "image/png"
-
-                        if not mime_type or not mime_type.startswith("image/"):
-                            mime_type = "image/png"
-
-                        try:
-                            cleaned = GeminiAPIClient._validate_and_normalize_b64(
-                                data,
-                                context=f"openai-url-idx-{idx}",
-                                allow_relaxed_return=True,
-                            )
-                        except APIError as e:
-                            # 校验失败时直接透传原始/去前缀的 base64，避免丢弃参考图
-                            raw = str(data).strip()
-                            if ";base64," in raw:
-                                _, _, raw = raw.partition(";base64,")
-                            cleaned = raw
-                            logger.debug(
-                                "openai-url 校验失败，直接透传 base64：idx=%s | %s",
+                    if not data:
+                        if is_url:
+                            # URL 下载失败，直接使用 URL 传输
+                            image_payload = {
+                                "type": "image_url",
+                                "image_url": {"url": image_str},
+                            }
+                            logger.info(
+                                "[openai] URL 下载失败，直接使用 URL 传输 idx=%s url=%s",
                                 idx,
-                                e.message,
+                                image_str[:80],
                             )
-                            fail_reasons.append(
-                                f"idx={idx} openai-url 校验失败，已透传 | {e.message}"
-                            )
-
-                        payload_url = (
-                            cleaned
-                            if force_b64
-                            else f"data:{mime_type};base64,{cleaned}"
-                        )
-
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": payload_url},
-                        }
-                        logger.debug(
-                            "OpenAI兼容API使用本地转码参考图: idx=%s mime=%s",
-                            idx,
-                            mime_type,
-                        )
-
-                    # data URL：走统一的规范化流程，确保格式受支持
-                    elif (
-                        image_str.startswith("data:image/") and ";base64," in image_str
-                    ):
-                        mime_type, data = await GeminiAPIClient._normalize_image_input(
-                            image_str, image_input_mode=config.image_input_mode
-                        )
-                        if not data:
-                            data = str(image_str).strip()
-
-                        if not mime_type or not mime_type.startswith("image/"):
-                            mime_type = "image/png"
-
-                        ext = mime_type.split("/")[-1]
-                        if ext and ext not in supported_exts:
-                            logger.debug(
-                                "data URL 图片格式不常见: idx=%s mime=%s",
-                                idx,
-                                mime_type,
-                            )
-
-                        try:
-                            normalized = GeminiAPIClient._validate_and_normalize_b64(
-                                data,
-                                context=f"openai-dataurl-{idx}",
-                                allow_relaxed_return=True,
-                            )
-                        except APIError as e:
-                            raw = str(data).strip()
-                            if ";base64," in raw:
-                                _, _, raw = raw.partition(";base64,")
-                            normalized = raw
-                            logger.debug(
-                                "data URL 校验失败，直接透传 base64：idx=%s | %s",
-                                idx,
-                                e.message,
-                            )
-                            fail_reasons.append(
-                                f"idx={idx} dataurl 校验失败，已透传 | {e.message}"
-                            )
-
-                        if force_b64:
-                            payload_url = normalized
                         else:
-                            payload_url = f"data:{mime_type};base64,{normalized}"
+                            # 非 URL 输入，透传原始数据
+                            data = image_str
+                            mime_type = GeminiAPIClient._ensure_mime_type(mime_type)
 
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": payload_url},
-                        }
-                        logger.debug(
-                            "OpenAI兼容API使用规范化data URL参考图: idx=%s mime=%s",
-                            idx,
-                            mime_type,
+                    if data and not image_payload:
+                        mime_type = GeminiAPIClient._ensure_mime_type(mime_type)
+
+                        # 校验 base64
+                        validated_data, is_valid = GeminiAPIClient()._validate_b64_with_fallback(
+                            data, context=f"openai-idx-{idx}"
                         )
 
-                    # 其他输入交给规范化逻辑，自动转换为 data URL
-                    else:
-                        mime_type, data = await GeminiAPIClient._normalize_image_input(
-                            image_input, image_input_mode=config.image_input_mode
-                        )
-                        if not data:
-                            # 与 google 分支一致：兜底使用原始字符串，避免直接中断
-                            data = str(image_input).strip()
-                            mime_type = mime_type or "image/png"
-                            fail_reasons.append(
-                                f"idx={idx} normalize 为空，已用原始字符串兜底"
-                            )
-
-                        if not mime_type or not mime_type.startswith("image/"):
-                            logger.debug(
-                                "未检测到明确的图片 MIME，默认使用 image/png: idx=%s",
+                        if not is_valid and is_url:
+                            # URL 转换的数据校验失败，直接使用 URL
+                            image_payload = {
+                                "type": "image_url",
+                                "image_url": {"url": image_str},
+                            }
+                            logger.info(
+                                "[openai] base64 校验失败，直接使用 URL 传输 idx=%s url=%s",
                                 idx,
+                                image_str[:80],
                             )
-                            mime_type = "image/png"
-
-                        ext = mime_type.split("/")[-1]
-                        if ext and ext not in supported_exts:
-                            logger.debug(
-                                "规范化后图片格式不常见: idx=%s mime=%s", idx, mime_type
+                        else:
+                            # 构建 data URL payload
+                            payload_url = (
+                                validated_data
+                                if force_b64
+                                else f"data:{mime_type};base64,{validated_data}"
                             )
-
-                        try:
-                            normalized = GeminiAPIClient._validate_and_normalize_b64(
-                                data,
-                                context=f"openai-other-{idx}",
-                                allow_relaxed_return=True,
-                            )
-                        except APIError as e:
-                            raw = str(data).strip()
-                            if ";base64," in raw:
-                                _, _, raw = raw.partition(";base64,")
-                            normalized = raw
-                            logger.debug(
-                                "参考图校验失败，直接透传 base64：idx=%s type=%s | %s",
-                                idx,
-                                type(image_input),
-                                e.message,
-                            )
-                            fail_reasons.append(
-                                f"idx={idx} other 校验失败，已透传 | {e.message}"
-                            )
-                        payload_url = (
-                            normalized
-                            if force_b64
-                            else f"data:{mime_type};base64,{normalized}"
-                        )
-
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": payload_url},
-                        }
+                            image_payload = {
+                                "type": "image_url",
+                                "image_url": {"url": payload_url},
+                            }
 
                     if image_payload:
                         message_content.append(image_payload)
@@ -733,29 +532,20 @@ class GeminiAPIClient:
                         added_refs += 1
                         elapsed_ms = (time.perf_counter() - per_start) * 1000
                         logger.debug(
-                            "参考图像处理完成: idx=%s 耗时=%.2fms 来源=%s",
-                            idx,
-                            elapsed_ms,
-                            parsed.scheme or "normalized",
-                        )
-                        logger.debug(
-                            "[openai] 成功处理参考图 idx=%s mime=%s size=%s",
+                            "[openai] 成功处理参考图 idx=%s mime=%s 耗时=%.2fms",
                             idx,
                             mime_type,
-                            len(str(cleaned if "cleaned" in locals() else data))
-                            if (locals().get("cleaned") or data)
-                            else 0,
+                            elapsed_ms,
                         )
+
                 except APIError as e:
                     logger.warning(
                         "处理参考图像时出现异常: idx=%s err=%s", idx, e.message or e
                     )
                     fail_reasons.append(f"idx={idx} APIError: {e.message or str(e)}")
-                    continue
                 except Exception as e:
                     logger.warning("处理参考图像时出现异常: idx=%s err=%s", idx, e)
                     fail_reasons.append(f"idx={idx} Exception: {e}")
-                    continue
 
             total_elapsed_ms = (time.perf_counter() - total_start) * 1000
             if processed_cache:
@@ -765,6 +555,7 @@ class GeminiAPIClient:
                     total_elapsed_ms,
                     total_elapsed_ms / len(processed_cache),
                 )
+
         if config.reference_images and added_refs == 0:
             raise APIError(
                 "参考图全部无效或下载失败，请重新发送图片后重试。"
@@ -827,6 +618,105 @@ class GeminiAPIClient:
             image_cache_dir=image_cache_dir or IMAGE_CACHE_DIR,
             image_input_mode=image_input_mode,
         )
+
+    async def _process_reference_image(
+        self,
+        image_input: Any,
+        idx: int,
+        image_input_mode: str = "force_base64",
+    ) -> tuple[str | None, str | None, bool]:
+        """
+        统一处理参考图像，返回 (mime_type, data, is_url)。
+
+        处理流程：
+        1. 尝试解析为本地文件路径
+        2. 尝试规范化转换为 base64
+        3. 尝试通过 QQ 下载器获取
+        4. 返回处理结果
+
+        Returns:
+            (mime_type, data, is_url):
+            - mime_type: MIME 类型
+            - data: base64 数据或 None（失败时）
+            - is_url: 原始输入是否为 URL
+        """
+        image_str = str(image_input).strip()
+        is_url = image_str.startswith(("http://", "https://"))
+
+        data = None
+        mime_type = None
+
+        # 1. 尝试解析为本地文件
+        try:
+            local_path = await resolve_image_source_to_path(
+                image_input,
+                image_input_mode=image_input_mode,
+                api_client=self,
+                download_qq_image_fn=download_qq_image,
+            )
+            if local_path and Path(local_path).exists():
+                suffix = Path(local_path).suffix.lower().lstrip(".") or "png"
+                mime_type = f"image/{suffix}"
+                data = encode_file_to_base64(local_path)
+        except Exception:
+            pass
+
+        # 2. 尝试规范化转换
+        if not data:
+            try:
+                temp_cache = Path(
+                    tempfile.mkdtemp(prefix="gemini_ref_tmp_", dir="/tmp")
+                )
+                mime_type, data = await self._normalize_image_input(
+                    image_input,
+                    image_input_mode=image_input_mode,
+                    image_cache_dir=temp_cache,
+                )
+            except Exception:
+                pass
+
+        # 3. 尝试 QQ 下载器
+        if not data and isinstance(image_input, str):
+            try:
+                qq_data = await download_qq_image(image_str)
+                if qq_data:
+                    if ";base64," in qq_data:
+                        mime_type = qq_data.split(";", 1)[0].replace("data:", "")
+                        _, _, data = qq_data.partition(";base64,")
+                    else:
+                        data = qq_data
+            except Exception:
+                pass
+
+        return mime_type, data, is_url
+
+    def _validate_b64_with_fallback(
+        self, data: str, context: str = ""
+    ) -> tuple[str, bool]:
+        """
+        校验 base64 数据，失败时返回透传的原始数据。
+
+        Returns:
+            (result, validated): result 是处理后的数据，validated 表示是否通过校验
+        """
+        try:
+            validated = self._validate_and_normalize_b64(
+                data, context=context, allow_relaxed_return=True
+            )
+            return validated, True
+        except APIError:
+            # 校验失败，透传原始数据（去掉 data URI 前缀）
+            raw = str(data).strip()
+            if ";base64," in raw:
+                _, _, raw = raw.partition(";base64,")
+            return raw, False
+
+    @staticmethod
+    def _ensure_mime_type(mime_type: str | None, default: str = "image/png") -> str:
+        """确保 MIME 类型有效"""
+        if mime_type and mime_type.startswith("image/"):
+            return mime_type
+        return default
 
     async def _get_api_url(
         self, config: ApiRequestConfig
