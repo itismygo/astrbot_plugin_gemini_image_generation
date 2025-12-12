@@ -431,7 +431,7 @@ class GeminiAPIClient:
         model: str,
         max_retries: int,
         total_timeout: int = 120,
-        api_base: str | None = None,
+        api_base: str = None,
     ) -> tuple[list[str], list[str], str | None, str | None]:
         """执行 API 请求并处理响应，每个重试有独立的超时控制"""
 
@@ -538,7 +538,7 @@ class GeminiAPIClient:
         model: str,
         *,
         timeout: aiohttp.ClientTimeout | None = None,
-        api_base: str | None = None,
+        api_base: str = None,
     ) -> tuple[list[str], list[str], str | None, str | None]:
         """执行实际的HTTP请求"""
         logger.debug(
@@ -588,13 +588,10 @@ class GeminiAPIClient:
 
             if response.status == 200:
                 logger.debug("API 调用成功")
-                provider = get_api_provider(api_type)
-                return await provider.parse_response(
-                    client=self,
-                    response_data=response_data,
-                    session=session,
-                    api_base=api_base,
-                )
+                if api_type == "google":
+                    return await self._parse_gresponse(response_data, session)
+                else:  # openai 兼容格式
+                    return await self._parse_openai_response(response_data, session, api_base)
             elif response.status in [429, 402, 403]:
                 error_msg = response_data.get("error", {}).get(
                     "message", f"HTTP {response.status}"
@@ -680,12 +677,259 @@ class GeminiAPIClient:
         )
 
     async def _parse_openai_response(
-        self, response_data: dict, session: aiohttp.ClientSession
+        self, response_data: dict, session: aiohttp.ClientSession, api_base: str = None
     ) -> tuple[list[str], list[str], str | None, str | None]:
         """解析 OpenAI API 响应"""
-        provider = get_api_provider("openai")
-        return await provider.parse_response(
-            client=self, response_data=response_data, session=session
+
+        image_urls: list[str] = []
+        image_paths: list[str] = []
+        text_content = None
+        thought_signature = None
+        fail_reasons: list[str] = []
+        fallback_texts = self._collect_fallback_texts(response_data)
+
+        message: dict[str, Any] | None = None
+        if "choices" in response_data and response_data["choices"]:
+            choice = response_data["choices"][0]
+            message = choice.get("message", {})
+        else:
+            message = self._coerce_basic_openai_message(response_data)
+
+        if message:
+            if "choices" not in response_data:
+                logger.debug(
+                    "[openai] 使用非标准字段构造 message，keys=%s",
+                    list(response_data.keys())[:5],
+                )
+            content = message.get("content", "")
+
+            text_chunks: list[str] = []
+            image_candidates: list[str] = []
+            extracted_urls: list[str] = []
+
+            logger.debug(
+                "[openai] 解析响应 choices，content_type=%s images_field=%s",
+                type(content),
+                bool(message.get("images")),
+            )
+
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+
+                    part_type = part.get("type")
+                    if part_type == "text" and "text" in part:
+                        text_val = str(part.get("text", ""))
+                        text_chunks.append(text_val)
+                        extracted_urls.extend(self._find_image_urls_in_text(text_val))
+                    elif part_type == "image_url":
+                        image_obj = part.get("image_url") or {}
+                        if isinstance(image_obj, dict):
+                            url_val = image_obj.get("url")
+                            if url_val:
+                                image_candidates.append(url_val)
+            elif isinstance(content, str):
+                text_chunks.append(content)
+                extracted_urls.extend(self._find_image_urls_in_text(content))
+
+            # 标准 images 字段（兼容 Gemini/OpenAI 混合格式）
+            if message.get("images"):
+                for image_item in message["images"]:
+                    if not isinstance(image_item, dict):
+                        continue
+
+                    # 典型格式：{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+                    image_obj = image_item.get("image_url")
+                    if isinstance(image_obj, dict):
+                        url_val = image_obj.get("url")
+                        if isinstance(url_val, str) and url_val:
+                            image_candidates.append(url_val)
+                    elif isinstance(image_obj, str) and image_obj:
+                        image_candidates.append(image_obj)
+                    # 退化格式：{"url": "..."}
+                    elif isinstance(image_item.get("url"), str):
+                        image_candidates.append(image_item["url"])
+
+            # 合并在文本里解析到的图像 URL
+            if extracted_urls:
+                image_candidates.extend(extracted_urls)
+
+            # 组装文本内容
+            if text_chunks:
+                text_content = " ".join([t for t in text_chunks if t]).strip() or None
+
+            # 按顺序处理图像候选
+            for candidate_url in image_candidates:
+                logger.debug("[openai] 处理候选URL: %s", str(candidate_url)[:120])
+                if isinstance(candidate_url, str) and candidate_url.startswith(
+                    "data:image/"
+                ):
+                    image_url, image_path = await self._parse_data_uri(candidate_url)
+                elif isinstance(candidate_url, str):
+                    # grok2api 适配：处理相对路径（如 /images/xxx）
+                    if candidate_url.startswith("/") and not candidate_url.startswith("//"):
+                        if api_base:
+                            # 从 api_base 提取 scheme 和 netloc
+                            parsed_base = urllib.parse.urlparse(api_base)
+                            base_url = f"{parsed_base.scheme}://{parsed_base.netloc}"
+                            full_url = urllib.parse.urljoin(base_url, candidate_url)
+                            # grok2api 适配：立即下载临时缓存的图片（避免被清理）
+                            logger.debug(f"[grok2api 适配] 相对路径转换并下载: {candidate_url} -> {full_url}")
+                            image_url, image_path = await self._download_image(full_url, session, use_cache=False)
+                            # 只保留本地路径（_download_image 返回的两个值相同，避免重复）
+                            if image_path:
+                                image_paths.append(image_path)
+                            continue
+                        else:
+                            logger.warning(f"发现相对路径 URL 但未提供 api_base，跳过: {candidate_url}")
+                            continue
+                    # 对于可访问的 http(s) 链接，直接返回 URL，避免重复下载占用带宽
+                    if candidate_url.startswith("http://") or candidate_url.startswith(
+                        "https://"
+                    ):
+                        # grok2api 适配：检测临时缓存 URL 并强制下载（避免被清理）
+                        # 临时缓存 URL 特征：包含 /images/users- 或 /temp/image/
+                        is_temp_cache = "/images/users-" in candidate_url or "/temp/image/" in candidate_url
+                        if is_temp_cache:
+                            logger.debug(f"[grok2api 适配] 检测到临时缓存 URL，强制下载: {candidate_url}")
+                            image_url, image_path = await self._download_image(candidate_url, session, use_cache=False)
+                            # 只保留本地路径（_download_image 返回的两个值相同，避免重复）
+                            if image_path:
+                                image_paths.append(image_path)
+                            continue
+                        # 其他永久 URL 直接使用
+                        image_urls.append(candidate_url)
+                        logger.debug(
+                            f"🖼️ OpenAI 返回可直接访问的图像链接: {candidate_url}"
+                        )
+                        continue
+                    image_url, image_path = await self._download_image(
+                        candidate_url, session, use_cache=False
+                    )
+                else:
+                    logger.warning(f"跳过非字符串类型的图像URL: {type(candidate_url)}")
+                    continue
+
+                if image_url or image_path:
+                    if image_url:
+                        image_urls.append(image_url)
+                    if image_path:
+                        image_paths.append(image_path)
+
+            # content 中查找内联 data URI（文本里）
+            extracted_urls: list[str] = []
+            extracted_paths: list[str] = []
+
+            if isinstance(content, str):
+                extracted_urls, extracted_paths = await self._extract_from_content(
+                    content
+                )
+            elif text_content:
+                extracted_urls, extracted_paths = await self._extract_from_content(
+                    text_content
+                )
+
+            if extracted_urls or extracted_paths:
+                image_urls.extend(extracted_urls)
+                image_paths.extend(extracted_paths)
+
+            # 额外在汇总文本中搜索 http(s) 图片链接，兼容只返回文本的情况
+            if text_content:
+                http_urls = self._find_image_urls_in_text(text_content)
+                for url in http_urls:
+                    # grok2api 适配：跳过临时缓存 URL（已在上面下载并添加到 image_paths）
+                    is_temp_cache = "/images/users-" in url or "/temp/image/" in url
+                    if is_temp_cache:
+                        logger.debug(f"[grok2api 适配] 跳过文本中的临时缓存 URL（已下载）: {url}")
+                        continue
+                    if url not in image_urls:
+                        image_urls.append(url)
+
+                # 松散提取 data:image 片段，避免因 Markdown/换行导致遗漏
+                loose_matches = re.finditer(
+                    r"data:image/([a-zA-Z0-9.+-]+);base64,([-A-Za-z0-9+/=_\\s]+)",
+                    text_content,
+                    flags=re.IGNORECASE,
+                )
+                for m in loose_matches:
+                    fmt = m.group(1)
+                    b64_raw = m.group(2)
+                    b64_clean = re.sub(r"\\s+", "", b64_raw)
+                    image_path = await save_base64_image(b64_clean, fmt.lower())
+                    if image_path:
+                        image_urls.append(image_path)
+                        image_paths.append(image_path)
+                        logger.debug(
+                            "[openai] 松散提取 data URI 成功: fmt=%s len=%s",
+                            fmt,
+                            len(b64_clean),
+                        )
+
+        else:
+            logger.debug("[openai] 响应缺少可用的 message 字段，尝试 data/b64 解析")
+
+        if not (image_urls or image_paths) and fallback_texts:
+            fallback_added = await self._append_images_from_texts(
+                fallback_texts, image_urls, image_paths
+            )
+            if fallback_added and not text_content:
+                text_content = (
+                    " ".join(t.strip() for t in fallback_texts if t and t.strip())
+                    or text_content
+                )
+
+        # OpenAI 格式
+        if not image_urls and not image_paths and response_data.get("data"):
+            for image_item in response_data["data"]:
+                if "url" in image_item:
+                    image_url, image_path = await self._download_image(
+                        image_item["url"], session, use_cache=False
+                    )
+                    if image_url:
+                        image_urls.append(image_url)
+                    if image_path:
+                        image_paths.append(image_path)
+                elif "b64_json" in image_item:
+                    image_path = await save_base64_image(image_item["b64_json"], "png")
+                    if image_path:
+                        # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
+                        image_urls.append(image_path)
+                        image_paths.append(image_path)
+
+        if image_urls or image_paths:
+            logger.info(f"[grok2api 调试] API 返回图片数量: paths={len(image_paths)}, urls={len(image_urls)}")
+            logger.info(f"[grok2api 调试] image_urls = {image_urls}")
+            logger.info(f"[grok2api 调试] image_paths = {image_paths}")
+            logger.debug(
+                f"🖼️ OpenAI 收集到 {len(image_paths) or len(image_urls)} 张图片"
+            )
+            return image_urls, image_paths, text_content, thought_signature
+
+        # 如果只有文本内容，也返回
+        if text_content:
+            # 如果配置了需要文本响应，且确实没有找到图片，这里应该报错触发重试而不是直接返回文本
+            # 除非这是一个纯文本请求（但在生图插件里通常不是）
+            detail = (
+                f" | 参考图处理提示: {'; '.join(fail_reasons[:3])}"
+                if fail_reasons
+                else ""
+            )
+            logger.debug(
+                "[openai] 仅返回文本，长度=%s 预览=%s",
+                len(text_content),
+                text_content[:200],
+            )
+            logger.warning(f"OpenAI只返回了文本响应，未生成图像，将触发重试{detail}")
+            logger.debug(f"OpenAI响应内容: {str(response_data)[:1000]}")
+            raise APIError(
+                f"图像生成失败：API只返回了文本响应，正在重试... | 响应预览: {str(response_data)[:300]}",
+                500,
+                "no_image_retry",
+            )
+
+        logger.warning(
+            f"OpenAI 响应格式不支持或未找到图像数据，响应: {str(response_data)[:500]}"
         )
 
     def _normalize_message_value(self, raw_value: Any) -> dict[str, Any] | None:
@@ -901,6 +1145,8 @@ class GeminiAPIClient:
         markdown_pattern = r"!\[[^\]]*\]\((https?://[^)]+)\)"
         # Markdown 图片语法中的 data URI（如 ![image](data:image/png;base64,...)）
         markdown_data_uri_pattern = r"!\[[^\]]*\]\((data:image/[^)]+)\)"
+        # grok2api 适配：支持相对路径 (如 ![image](/images/xxx))
+        markdown_relative_pattern = r"!\[[^\]]*\]\((/[^)]+|[^/:)]+/[^)]+)\)"
         raw_pattern = (
             r"(https?://[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|tiff|avif))(?:\b|$)"
         )
@@ -911,12 +1157,19 @@ class GeminiAPIClient:
 
         def _push(candidate: str):
             cleaned = candidate.strip().replace("&amp;", "&").rstrip(").,;")
+            # grok2api 适配：移除 URL 两端的引号（单引号或双引号）
+            cleaned = cleaned.strip('\'"')
             if cleaned and cleaned not in seen:
                 seen.add(cleaned)
                 urls.append(cleaned)
 
         for pattern in (markdown_pattern, markdown_data_uri_pattern, raw_pattern):
             for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                _push(match)
+
+        # grok2api 适配：提取相对路径
+        for match in re.findall(markdown_relative_pattern, text, flags=re.IGNORECASE):
+            if not match.startswith(("http://", "https://", "data:")):
                 _push(match)
 
         # 适配带空格的 http:// 片段（如 "http: //1. 2. 3. 4/image.png"）
