@@ -93,6 +93,17 @@ class GeminiImageGenerationPlugin(Star):
         "本人",
     )
 
+    # 快速模式键（集中管理）
+    QUICK_MODES = (
+        "avatar",
+        "poster",
+        "wallpaper",
+        "card",
+        "mobile",
+        "figure",
+        "sticker",
+    )
+
     def __init__(self, context: Context, config: dict[str, Any]):
         super().__init__(context)
         self.config = config
@@ -239,7 +250,9 @@ class GeminiImageGenerationPlugin(Star):
             for user_id in mentioned_users:
                 logger.debug(f"获取@用户头像: {user_id}")
                 download_tasks.append(
-                    download_qq_avatar(str(user_id), f"mentioned_{user_id}", event=event)
+                    download_qq_avatar(
+                        str(user_id), f"mentioned_{user_id}", event=event
+                    )
                 )
         else:
             if (
@@ -380,6 +393,23 @@ class GeminiImageGenerationPlugin(Star):
         self.enable_llm_crop = image_settings.get(
             "enable_llm_crop", True
         )  # 默认True，需保留
+
+        # 表情包提示词相关设置
+        grid_raw = str(image_settings.get("sticker_grid") or "4x4").strip()
+        m = re.match(r"^\s*(\d{1,2})\s*[xX]\s*(\d{1,2})\s*$", grid_raw)
+        if m:
+            self.sticker_grid_rows = int(m.group(1))
+            self.sticker_grid_cols = int(m.group(2))
+        else:
+            self.sticker_grid_rows = 4
+            self.sticker_grid_cols = 4
+        self.sticker_grid_rows = min(max(self.sticker_grid_rows, 1), 20)
+        self.sticker_grid_cols = min(max(self.sticker_grid_cols, 1), 20)
+
+        # 表情包裁剪识别行列：不暴露为配置项，使用内部默认值即可
+        self.sticker_bbox_rows = 6
+        self.sticker_bbox_cols = 4
+
         # 从配置中读取强制分辨率设置，默认为False
         self.force_resolution = image_settings.get("force_resolution") or False
         # 自定义 API 参数名（支持不同 API 的命名差异）
@@ -396,15 +426,7 @@ class GeminiImageGenerationPlugin(Star):
         # 快速模式参数覆盖（可选）
         quick_mode_settings = self.config.get("quick_mode_settings") or {}
         self.quick_mode_overrides: dict[str, tuple[str | None, str | None]] = {}
-        for mode_key in (
-            "avatar",
-            "poster",
-            "wallpaper",
-            "card",
-            "mobile",
-            "figure",
-            "sticker",
-        ):
+        for mode_key in self.QUICK_MODES:
             mode_settings = quick_mode_settings.get(mode_key) or {}
             override_res = (mode_settings.get("resolution") or "").strip()
             override_ar = (mode_settings.get("aspect_ratio") or "").strip()
@@ -509,7 +531,10 @@ class GeminiImageGenerationPlugin(Star):
             # 读取图片尺寸用于提示
             with PILImage.open(image_path) as img:
                 width, height = img.size
-            prompt = get_sticker_bbox_prompt(rows=6, cols=4)
+            prompt = get_sticker_bbox_prompt(
+                rows=self.sticker_bbox_rows,
+                cols=self.sticker_bbox_cols,
+            )
 
             # 若图过大，先生成压缩副本以提升识别成功率
             image_urls: list[str] = []
@@ -841,14 +866,17 @@ class GeminiImageGenerationPlugin(Star):
                     "✗ AstrBot 加载完成后仍未初始化 API 客户端，请检查提供商配置"
                 )
 
-    def _ensure_api_client(self) -> bool:
+    def _ensure_api_client(self, *, quiet: bool = False) -> bool:
         """确保 API 客户端已初始化，启动初期 provider_mgr 可能尚未就绪"""
         if self.api_client:
             logger.debug("api_client 已就绪")
             return True
-        self._load_provider_from_context(quiet=True)
+        self._load_provider_from_context(quiet=quiet)
         if not self.api_client:
-            logger.error("✗ API 客户端仍未初始化，请检查 AstrBot 提供商配置")
+            if quiet:
+                logger.debug("API 客户端仍未初始化（quiet=True，跳过错误日志）")
+            else:
+                logger.error("✗ API 客户端仍未初始化，请检查 AstrBot 提供商配置")
             return False
         return True
 
@@ -861,8 +889,17 @@ class GeminiImageGenerationPlugin(Star):
         manual_api_type = (api_settings.get("api_type") or "").strip()
         manual_api_base = (api_settings.get("custom_api_base") or "").strip()
         manual_model = (api_settings.get("model") or "").strip()
+
+        # 只按配置文件决定 API 类型
         if manual_api_type and not self.api_type:
             self.api_type = manual_api_type
+        elif not self.api_type:
+            if not quiet:
+                logger.error(
+                    "✗ 未配置 api_settings.api_type（google/openai/zai/grok2api），无法初始化 API 客户端"
+                )
+            return
+
         if manual_api_base and not self.api_base:
             self.api_base = manual_api_base
         if manual_model and not self.model:
@@ -883,17 +920,6 @@ class GeminiImageGenerationPlugin(Star):
                 # 补全 provider_id，便于后续视觉识别调用
                 if not self.provider_id:
                     self.provider_id = provider.provider_config.get("id", "")
-                prov_type = str(provider.provider_config.get("type", "")).lower()
-                # 如果用户未显式选择 api_type，则按提供商类型推断
-                if not manual_api_type:
-                    if "googlegenai" in prov_type or "gemini" in prov_type:
-                        self.api_type = "google"
-                    elif "openai" in prov_type:
-                        self.api_type = "openai"
-                    else:
-                        logger.warning(
-                            f"提供商 {provider.provider_config.get('id')} 类型 {prov_type} 非Gemini/OpenAI，可能无法生成图像"
-                        )
 
                 prov_model = provider.get_model() or provider.provider_config.get(
                     "model_config", {}
@@ -1403,9 +1429,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         response_modalities = "TEXT_IMAGE" if self.enable_text_response else "IMAGE"
         effective_resolution = (
-            override_resolution
-            if override_resolution is not None
-            else self.resolution
+            override_resolution if override_resolution is not None else self.resolution
         )
         effective_aspect_ratio = (
             override_aspect_ratio
@@ -1577,22 +1601,38 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         if not self.vision_provider_id:
             return None
 
+        # 视觉识别前确保拿到可读取的本地文件路径（URL 需要先下载）
+        local_path = image_path
+        if isinstance(image_path, str) and image_path.startswith(
+            ("http://", "https://")
+        ):
+            try:
+                if self.api_client and hasattr(self.api_client, "_get_session"):
+                    session = await self.api_client._get_session()
+                    _, downloaded = await self.api_client._download_image(
+                        image_path, session, use_cache=False
+                    )
+                    if downloaded and Path(downloaded).exists():
+                        local_path = downloaded
+            except Exception as e:
+                logger.debug(f"[GRID_DETECT] 下载图片失败，回退使用原始URL: {e}")
+
         try:
-            with PILImage.open(image_path) as img:
+            with PILImage.open(local_path) as img:
                 width, height = img.size
                 max_side = max(width, height)
-                vision_input_path = image_path
+                vision_input_path = local_path
                 if max_side > 1200:
                     ratio = 1200 / max_side
                     new_w = int(width * ratio)
                     new_h = int(height * ratio)
                     img = img.resize((new_w, new_h))
-                    tmp_path = Path("/tmp") / f"grid_detect_{Path(image_path).stem}.png"
+                    tmp_path = Path("/tmp") / f"grid_detect_{Path(local_path).stem}.png"
                     img.save(tmp_path, format="PNG")
                     vision_input_path = str(tmp_path)
         except Exception as e:
             logger.debug(f"[GRID_DETECT] 读取/压缩图片失败，使用原图: {e}")
-            vision_input_path = image_path
+            vision_input_path = local_path
 
         prompt = get_grid_detect_prompt()
 
@@ -1709,7 +1749,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     event.plain_result(
                         "❌ 未能成功生成图像。\n"
                         "🧐 可能原因：模型返回空结果、提示词冲突或参考图处理异常。\n"
-                        "✅ 建议：简化描述、减少参考图数量后再试，或稍后重试。"
+                        "✅ 建议：简化描述、减少参考图后重试，或稍后重试。"
                     ),
                 ):
                     yield res
@@ -1871,7 +1911,7 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
             self.log_debug(f"  - 是否改图请求: {is_modification_request}")
             self.log_debug(f"  - 模型: {self.model}")
 
-            yield event.plain_result("🎨 生成中...")
+            yield event.plain_result("🎨  生成中...")
 
             (
                 image_urls,
@@ -2121,9 +2161,17 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
         )
         if not self.enable_sticker_split:
             full_prompt = (
-                get_q_version_sticker_prompt(user_prompt)
+                get_q_version_sticker_prompt(
+                    user_prompt,
+                    rows=self.sticker_grid_rows,
+                    cols=self.sticker_grid_cols,
+                )
                 if simple_mode
-                else get_sticker_prompt(user_prompt)
+                else get_sticker_prompt(
+                    user_prompt,
+                    rows=self.sticker_grid_rows,
+                    cols=self.sticker_grid_cols,
+                )
             )
             async for result in self._quick_generate_image(
                 event,
@@ -2137,9 +2185,17 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
 
         # 开启了切割功能，执行自定义逻辑
         full_prompt = (
-            get_q_version_sticker_prompt(user_prompt)
+            get_q_version_sticker_prompt(
+                user_prompt,
+                rows=self.sticker_grid_rows,
+                cols=self.sticker_grid_cols,
+            )
             if simple_mode
-            else get_sticker_prompt(user_prompt)
+            else get_sticker_prompt(
+                user_prompt,
+                rows=self.sticker_grid_rows,
+                cols=self.sticker_grid_cols,
+            )
         )
         api_start_time = time.perf_counter()
         try:
@@ -2183,6 +2239,34 @@ The last {final_avatar_count} image(s) provided are User Avatars (marked as opti
                     "✅ 建议：检查日志后重试，或更换模型/提示词。"
                 )
                 return
+
+            # 表情包切割依赖本地文件路径：如果上游只返回了 URL，先下载到本地
+            primary_source = primary_image_path
+            if primary_image_path.startswith(("http://", "https://")):
+                try:
+                    if self.api_client and hasattr(self.api_client, "_get_session"):
+                        session = await self.api_client._get_session()
+                        _, downloaded = await self.api_client._download_image(
+                            primary_image_path, session, use_cache=False
+                        )
+                        if downloaded and Path(downloaded).exists():
+                            primary_image_path = downloaded
+                        else:
+                            raise RuntimeError("下载结果为空")
+                    else:
+                        raise RuntimeError("API 客户端不可用")
+                except Exception as e:
+                    logger.warning(f"表情源图下载失败: {e}")
+                    yield event.plain_result(
+                        "❌ 表情源图为远程链接，但下载到本地失败，无法切割。\n"
+                        "🧐 可能原因：图片链接临时失效/网络受限/上游防盗链。\n"
+                        "✅ 建议：稍后重试，或在群内直接发送图片再试。"
+                    )
+                    async for res in self._safe_send(
+                        event, event.image_result(primary_source)
+                    ):
+                        yield res
+                    return
 
             ai_rows = None
             ai_cols = None

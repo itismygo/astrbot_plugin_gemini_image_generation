@@ -7,21 +7,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import json
 import os
 import re
 import tempfile
-import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 
 from astrbot.api import logger
+
+from .api import get_api_provider
+from .api_types import APIError, ApiRequestConfig
 
 try:
     from .tl_utils import (
@@ -82,48 +82,6 @@ except ImportError:
         image_input: Any, *, image_cache_dir=None, image_input_mode="force_base64"
     ):
         return None, None
-
-
-@dataclass
-class ApiRequestConfig:
-    """API 请求配置（基于 Gemini 官方文档）"""
-
-    model: str
-    prompt: str
-    api_type: str = "openai"
-    api_base: str | None = None
-    api_key: str | None = None
-    resolution: str | None = None
-    aspect_ratio: str | None = None
-    enable_grounding: bool = False
-    response_modalities: str = "TEXT_IMAGE"  # 默认同时返回文本和图像
-    max_tokens: int = 1000
-    reference_images: list[str] | None = None
-    response_text: str | None = None  # 存储文本响应
-    enable_smart_retry: bool = True  # 智能重试开关
-    enable_text_response: bool = False  # 文本响应开关
-    force_resolution: bool = False  # 强制传递分辨率参数
-    verbose_logging: bool = False  # 详细日志开关
-    image_input_mode: str = "force_base64"  # 参考图统一转 base64
-
-    # 官方文档推荐参数
-    temperature: float = 0.7  # 控制生成随机性，0.0-1.0
-    seed: int | None = None  # 固定种子以确保一致性
-    safety_settings: dict | None = None  # 安全设置
-
-    # 自定义 API 参数名（支持不同 API 的字段命名差异）
-    resolution_param_name: str = "image_size"  # 分辨率参数名
-    aspect_ratio_param_name: str = "aspect_ratio"  # 长宽比参数名
-
-
-class APIError(Exception):
-    """API 错误基类"""
-
-    def __init__(self, message: str, status_code: int = None, error_type: str = None):
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
-        self.error_type = error_type
 
 
 class GeminiAPIClient:
@@ -265,397 +223,16 @@ class GeminiAPIClient:
                 )
 
     async def _prepare_google_payload(self, config: ApiRequestConfig) -> dict[str, Any]:
-        """准备 Google 官方 API 请求负载（遵循官方规范）"""
-        logger.debug(
-            "[google] 构建 payload: model=%s refs=%s force_b64=%s aspect=%s res=%s",
-            config.model,
-            len(config.reference_images or []),
-            config.image_input_mode,
-            config.aspect_ratio,
-            config.resolution,
-        )
-        parts = [{"text": config.prompt}]
-
-        added_refs = 0
-        fail_reasons: list[str] = []
-        if config.reference_images:
-            for idx, image_input in enumerate(config.reference_images[:14]):
-                image_str = str(image_input).strip()
-                logger.debug(
-                    "[google] 处理参考图 idx=%s type=%s preview=%s",
-                    idx,
-                    type(image_input),
-                    image_str[:120],
-                )
-
-                # 使用统一的参考图处理方法
-                mime_type, data, is_url = await self._process_reference_image(
-                    image_input, idx, config.image_input_mode
-                )
-
-                if not data:
-                    # 转换失败处理
-                    if is_url:
-                        # URL 下载失败，改用 fileData 格式传输
-                        parts.append({"fileData": {"fileUri": image_str}})
-                        added_refs += 1
-                        logger.info(
-                            "[google] URL 下载失败，改用 fileData 传输 idx=%s url=%s",
-                            idx,
-                            image_str[:80],
-                        )
-                        continue
-                    else:
-                        # 非 URL 输入，直接透传原始数据
-                        data = image_str
-                        mime_type = self._ensure_mime_type(mime_type)
-                        logger.debug(
-                            "[google] 转换失败，直接透传原始数据 idx=%s preview=%s",
-                            idx,
-                            image_str[:80],
-                        )
-
-                # 校验 base64，失败则透传或回退 URL
-                validated_data, is_valid = self._validate_b64_with_fallback(
-                    data, context="google-inline"
-                )
-
-                if not is_valid and is_url:
-                    # URL 转换的数据校验失败，改用 fileData
-                    parts.append({"fileData": {"fileUri": image_str}})
-                    added_refs += 1
-                    logger.info(
-                        "[google] base64 校验失败，改用 fileData 传输 idx=%s url=%s",
-                        idx,
-                        image_str[:80],
-                    )
-                    continue
-
-                mime_type = self._ensure_mime_type(mime_type)
-                logger.debug(
-                    "[google] 成功处理参考图 idx=%s mime=%s size=%s",
-                    idx,
-                    mime_type,
-                    len(validated_data) if validated_data else 0,
-                )
-
-                parts.append({"inlineData": {"mimeType": mime_type, "data": validated_data}})
-                added_refs += 1
-
-        if config.reference_images and added_refs == 0:
-            raise APIError(
-                "参考图全部无效或下载失败，请重新发送图片后重试。"
-                + (f" 详情: {'; '.join(fail_reasons[:3])}" if fail_reasons else ""),
-                None,
-                "invalid_reference_image",
-            )
-
-        contents = [{"role": "user", "parts": parts}]
-
-        generation_config = {"responseModalities": ["TEXT", "IMAGE"]}
-
-        # 根据官方文档，图像生成必须同时包含 TEXT 和 IMAGE modalities
-        # 这样可以确保返回图像而不是纯文本
-        modalities_map = {
-            "TEXT": ["TEXT"],
-            "IMAGE": ["IMAGE"],
-            "TEXT_IMAGE": ["TEXT", "IMAGE"],
-        }
-
-        # 获取配置的模态
-        modalities = modalities_map.get(config.response_modalities, ["TEXT", "IMAGE"])
-
-        # 确保包含图像模态
-        if "IMAGE" not in modalities:
-            logger.warning("配置中缺少 IMAGE modality，自动添加以支持图像生成")
-            modalities.append("IMAGE")
-
-        # 确保包含文本模态
-        if "TEXT" not in modalities:
-            logger.debug("添加 TEXT modality 以提供更好的兼容性")
-            modalities.append("TEXT")
-
-        generation_config["responseModalities"] = modalities
-        logger.debug(f"响应模态: {modalities}")
-
-        image_config = {}
-
-        # 获取自定义参数名（支持不同 API 的命名差异）
-        # 先 strip 再检查是否为空，避免空格字符串导致空键
-        _res_key = (config.resolution_param_name or "").strip()
-        resolution_key = _res_key if _res_key else "image_size"
-        _aspect_key = (config.aspect_ratio_param_name or "").strip()
-        aspect_ratio_key = _aspect_key if _aspect_key else "aspect_ratio"
-
-        # 根据官方文档设置图像尺寸
-        if config.resolution:
-            resolution = config.resolution.upper()
-
-            if resolution in ["1K", "1024X1024"]:
-                image_config[resolution_key] = "1K"
-                logger.debug(f"设置图像尺寸: 1K (参数名: {resolution_key})")
-            elif resolution in ["2K", "2048X2048"]:
-                image_config[resolution_key] = "2K"
-                logger.debug(f"设置图像尺寸: 2K (参数名: {resolution_key})")
-            elif resolution in ["4K", "4096X4096"]:
-                image_config[resolution_key] = "4K"
-                logger.debug(f"设置图像尺寸: 4K (参数名: {resolution_key})")
-            else:
-                # 自定义分辨率值，直接透传
-                image_config[resolution_key] = config.resolution
-                logger.debug(f"设置图像尺寸: {config.resolution} (参数名: {resolution_key})")
-
-        # 设置长宽比（支持任意自定义比例）
-        if config.aspect_ratio:
-            ratio = config.aspect_ratio.strip()
-            image_config[aspect_ratio_key] = ratio
-            logger.debug(f"设置长宽比: {ratio} (参数名: {aspect_ratio_key})")
-
-        if image_config:
-            generation_config["image_config"] = image_config
-
-        # 添加官方文档推荐参数
-        if config.temperature is not None:
-            generation_config["temperature"] = config.temperature
-        if config.seed is not None:
-            generation_config["seed"] = config.seed
-        if config.safety_settings:
-            generation_config["safetySettings"] = config.safety_settings
-
-        tools = []
-        if config.enable_grounding:
-            tools.append({"google_search": {}})
-
-        payload = {"contents": contents, "generationConfig": generation_config}
-
-        if tools:
-            payload["tools"] = tools
-
-        # 调试：记录 image_config
-        if "image_config" in generation_config:
-            logger.debug(
-                f"实际发送的 image_config: {generation_config['image_config']}"
-            )
-
-        return payload
+        """向后兼容：委托给 GoogleProvider 构建 payload。"""
+        provider = get_api_provider("google")
+        req = await provider.build_request(client=self, config=config)
+        return req.payload
 
     async def _prepare_openai_payload(self, config: ApiRequestConfig) -> dict[str, Any]:
-        """准备 OpenAI API 请求负载"""
-        message_content = [
-            {"type": "text", "text": f"Generate an image: {config.prompt}"}
-        ]
-
-        force_b64 = (
-            str(getattr(config, "image_input_mode", "auto")).lower() == "force_base64"
-        )
-
-        supported_exts = {
-            "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "avif",
-        }
-
-        if config.reference_images:
-            # 本地缓存避免重复处理同一引用图，记录耗时便于性能观察
-            processed_cache: dict[str, dict[str, Any]] = {}
-            total_start = time.perf_counter()
-
-            for idx, image_input in enumerate(config.reference_images[:6]):
-                per_start = time.perf_counter()
-                image_str = str(image_input).strip()
-                if not image_str:
-                    logger.warning(f"跳过空白参考图像: idx={idx}")
-                    continue
-
-                if "&amp;" in image_str:
-                    image_str = image_str.replace("&amp;", "&")
-
-                # 命中缓存直接复用，避免重复 base64 处理
-                if image_str in processed_cache:
-                    logger.debug(f"参考图像命中缓存: idx={idx}")
-                    message_content.append(processed_cache[image_str])
-                    continue
-
-                parsed = urllib.parse.urlparse(image_str)
-                image_payload: dict[str, Any] | None = None
-
-                try:
-                    # 优先处理 http(s) URL，确保 scheme 和 netloc 合法
-                    if (
-                        parsed.scheme in ("http", "https")
-                        and parsed.netloc
-                        and not force_b64
-                    ):
-                        ext = Path(parsed.path).suffix.lower().lstrip(".")
-                        if ext and ext not in supported_exts:
-                            logger.debug(
-                                "参考图像URL扩展名不在常见列表: idx=%s ext=%s url=%s",
-                                idx, ext, image_str[:80],
-                            )
-
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": image_str},
-                        }
-                        logger.debug(
-                            "OpenAI兼容API使用URL参考图: idx=%s ext=%s url=%s",
-                            idx, ext or "unknown", image_str[:120],
-                        )
-
-                    # data URL：直接校验 base64，有效则不再重复转码
-                    elif image_str.startswith("data:image/") and ";base64," in image_str:
-                        header, _, data_part = image_str.partition(";base64,")
-                        mime_type = header.replace("data:", "").lower()
-                        try:
-                            base64.b64decode(data_part, validate=True)
-                        except (binascii.Error, ValueError) as e:
-                            logger.warning(
-                                "跳过无效的 data URL 参考图: idx=%s 错误=%s", idx, e
-                            )
-                            mime_type = None
-
-                        if mime_type:
-                            ext = mime_type.split("/")[-1]
-                            if ext and ext not in supported_exts:
-                                logger.debug(
-                                    "data URL 图片格式不常见: idx=%s mime=%s", idx, mime_type,
-                                )
-                            image_payload = {
-                                "type": "image_url",
-                                "image_url": {"url": image_str},
-                            }
-                            logger.debug(
-                                "OpenAI兼容API使用data URL参考图: idx=%s mime=%s", idx, mime_type,
-                            )
-
-                    # 其他输入交给规范化逻辑，自动转换为 data URL
-                    else:
-                        mime_type, data = await self._normalize_image_input(
-                            image_input, image_input_mode=config.image_input_mode
-                        )
-                        if not data:
-                            if force_b64:
-                                raise APIError(
-                                    f"参考图转 base64 失败（force_base64），idx={idx}, type={type(image_input)}",
-                                    None, "invalid_reference_image",
-                                )
-                            logger.warning(
-                                "跳过无法识别/读取的参考图像: idx=%s type=%s", idx, type(image_input),
-                            )
-                            continue
-
-                        if not mime_type or not mime_type.startswith("image/"):
-                            logger.debug(
-                                "未检测到明确的图片 MIME，默认使用 image/png: idx=%s", idx,
-                            )
-                            mime_type = "image/png"
-
-                        ext = mime_type.split("/")[-1]
-                        if ext and ext not in supported_exts:
-                            logger.debug(
-                                "规范化后图片格式不常见: idx=%s mime=%s", idx, mime_type
-                            )
-
-                        if force_b64:
-                            # force_base64 模式：校验后构建 data URL
-                            cleaned = data.strip().replace("\n", "")
-                            try:
-                                base64.b64decode(cleaned, validate=True)
-                            except Exception:
-                                raise APIError(
-                                    f"参考图 base64 校验失败（force_base64），来源: idx={idx}",
-                                    None, "invalid_reference_image",
-                                )
-                            # OpenAI 兼容 API 需要完整的 data URL 格式
-                            payload_url = f"data:{mime_type};base64,{cleaned}"
-                        else:
-                            payload_url = f"data:{mime_type};base64,{data}"
-
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": payload_url},
-                        }
-
-                    if image_payload:
-                        message_content.append(image_payload)
-                        processed_cache[image_str] = image_payload
-                        elapsed_ms = (time.perf_counter() - per_start) * 1000
-                        logger.debug(
-                            "参考图像处理完成: idx=%s 耗时=%.2fms 来源=%s",
-                            idx, elapsed_ms, parsed.scheme or "normalized",
-                        )
-                except Exception as e:
-                    logger.warning("处理参考图像时出现异常: idx=%s err=%s", idx, e)
-                    continue
-
-            total_elapsed_ms = (time.perf_counter() - total_start) * 1000
-            if processed_cache:
-                logger.debug(
-                    "参考图像处理统计: 总数=%s 总耗时=%.2fms 平均=%.2fms",
-                    len(processed_cache), total_elapsed_ms,
-                    total_elapsed_ms / len(processed_cache),
-                )
-
-        # OpenAI 兼容接口下：
-        # - 使用 chat/completions
-        # - modalities: ["image", "text"]
-        # - image_config: {aspect_ratio, image_size}
-        # - tools: [{google_search:{}}]（当启用搜索接地时）
-        payload: dict[str, Any] = {
-            "model": config.model,
-            "messages": [{"role": "user", "content": message_content}],
-            "max_tokens": config.max_tokens,
-            "temperature": 0.7,
-            "modalities": ["image", "text"],
-            # 明确关闭流式响应，避免部分 OpenAI 兼容服务默认返回 SSE
-            "stream": False,
-        }
-
-        # 获取自定义参数名（支持不同 API 的命名差异）
-        # 先 strip 再检查是否为空，避免空格字符串导致空键
-        _res_key = (config.resolution_param_name or "").strip()
-        resolution_key = _res_key if _res_key else "image_size"
-        _aspect_key = (config.aspect_ratio_param_name or "").strip()
-        aspect_ratio_key = _aspect_key if _aspect_key else "aspect_ratio"
-
-        # 仅在 Gemini 3 Pro Image 系列模型下传递分辨率到 image_config（除非 force_resolution）
-        model_name = (config.model or "").lower()
-        is_gemini_image_model = (
-            "gemini-3-pro-image" in model_name
-            or "gemini-3-pro-preview" in model_name
-            or config.force_resolution
-        )
-
-        if config.api_type == "zai":
-            # Zai 兼容模式：按顶层字段 + generation_config 发送（参考 openai_chat_client.py）
-            generation_config: dict[str, Any] = {}
-
-            if config.resolution:
-                payload[resolution_key] = config.resolution
-                generation_config[resolution_key] = config.resolution
-
-            if config.aspect_ratio:
-                payload[aspect_ratio_key] = config.aspect_ratio
-                generation_config[aspect_ratio_key] = config.aspect_ratio
-
-            if generation_config:
-                payload["generation_config"] = generation_config
-        else:
-            # 默认模式：使用 image_config 对象
-            image_config: dict[str, Any] = {}
-
-            if config.aspect_ratio:
-                image_config[aspect_ratio_key] = config.aspect_ratio
-
-            if is_gemini_image_model and config.resolution:
-                image_config[resolution_key] = config.resolution
-
-            if image_config:
-                payload["image_config"] = image_config
-
-        # 与前端 router 一致：启用搜索接地时，通过 tools.google_search 控制
-        if is_gemini_image_model and config.enable_grounding:
-            payload["tools"] = [{"google_search": {}}]
-
-        return payload
+        """向后兼容：委托给 OpenAICompatProvider 构建 payload。"""
+        provider = get_api_provider(config.api_type)
+        req = await provider.build_request(client=self, config=config)
+        return req.payload
 
     async def _normalize_image_input(
         self,
@@ -709,9 +286,13 @@ class GeminiAPIClient:
                 suffix = Path(local_path).suffix.lower().lstrip(".") or "png"
                 mime_type = f"image/{suffix}"
                 data = encode_file_to_base64(local_path)
-                logger.debug(f"[_process_reference_image] 从本地文件获取成功: idx={idx}")
+                logger.debug(
+                    f"[_process_reference_image] 从本地文件获取成功: idx={idx}"
+                )
         except Exception as e:
-            logger.debug(f"[_process_reference_image] 本地文件解析失败: idx={idx} err={e}")
+            logger.debug(
+                f"[_process_reference_image] 本地文件解析失败: idx={idx} err={e}"
+            )
 
         # 2. 尝试规范化转换
         if not data:
@@ -725,11 +306,17 @@ class GeminiAPIClient:
                     image_cache_dir=temp_cache,
                 )
                 if data:
-                    logger.debug(f"[_process_reference_image] 规范化转换成功: idx={idx} mime={mime_type}")
+                    logger.debug(
+                        f"[_process_reference_image] 规范化转换成功: idx={idx} mime={mime_type}"
+                    )
                 else:
-                    logger.debug(f"[_process_reference_image] 规范化转换返回空: idx={idx}")
+                    logger.debug(
+                        f"[_process_reference_image] 规范化转换返回空: idx={idx}"
+                    )
             except Exception as e:
-                logger.debug(f"[_process_reference_image] 规范化转换失败: idx={idx} err={e}")
+                logger.debug(
+                    f"[_process_reference_image] 规范化转换失败: idx={idx} err={e}"
+                )
 
         # 3. QQ 下载器逻辑已整合到 normalize_image_input 和 resolve_image_source_to_path 中
 
@@ -771,62 +358,9 @@ class GeminiAPIClient:
 
         智能处理API路径前缀，无需手动输入/v1或/v1beta
         """
-        # 确定 API 基础地址（支持反代）
-        if config.api_base:
-            api_base = config.api_base.rstrip("/")
-            logger.debug(f"使用自定义 API Base: {api_base}")
-        else:
-            if config.api_type == "google":
-                api_base = self.GOOGLE_API_BASE
-            else:  # openai 兼容格式
-                api_base = self.OPENAI_API_BASE
-
-            logger.debug(f"使用默认 API Base ({config.api_type}): {api_base}")
-
-        # 智能构建完整URL，自动添加正确的路径前缀（如果需要的话）
-        if config.api_type == "google":
-            # Google API 需要版本前缀
-            if not config.api_base or api_base == self.GOOGLE_API_BASE:
-                # 使用默认官方地址，直接使用完整路径
-                url = f"{api_base}/models/{config.model}:generateContent"
-            elif not any(api_base.endswith(suffix) for suffix in ["/v1beta", "/v1"]):
-                # 自定义地址但没有版本前缀，自动添加
-                url = f"{api_base}/v1beta/models/{config.model}:generateContent"
-                logger.debug("为Google API自动添加v1beta前缀")
-            else:
-                # 已经包含版本前缀，直接使用
-                url = f"{api_base}/models/{config.model}:generateContent"
-                logger.debug("使用已包含版本前缀的Google API地址")
-
-            payload = await self._prepare_google_payload(config)
-            headers = {
-                "x-goog-api-key": config.api_key,
-                "Content-Type": "application/json",
-            }
-        else:
-            # OpenAI 兼容格式
-            if not config.api_base or api_base == self.OPENAI_API_BASE:
-                # 使用默认地址，需要完整路径
-                url = f"{api_base}/chat/completions"
-            elif not any(api_base.endswith(suffix) for suffix in ["/v1", "/v1beta"]):
-                # 自定义地址但没有版本前缀，自动添加
-                url = f"{api_base}/v1/chat/completions"
-                logger.debug("为OpenAI兼容API自动添加v1前缀")
-            else:
-                # 已经包含版本前缀，直接使用
-                url = f"{api_base}/chat/completions"
-                logger.debug("使用已包含版本前缀的OpenAI兼容API地址")
-
-            payload = await self._prepare_openai_payload(config)
-            headers = {
-                "Authorization": f"Bearer {config.api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/astrbot",
-                "X-Title": "AstrBot Gemini Image Advanced",
-            }
-
-        logger.debug(f"智能构建API URL: {url}")
-        return url, headers, payload
+        provider = get_api_provider(config.api_type)
+        req = await provider.build_request(client=self, config=config)
+        return req.url, req.headers, req.payload
 
     async def generate_image(
         self,
@@ -885,6 +419,7 @@ class GeminiAPIClient:
             model=config.model,
             max_retries=max_retries,
             total_timeout=total_timeout,
+            api_base=config.api_base,
         )
 
     async def _make_request(
@@ -896,6 +431,7 @@ class GeminiAPIClient:
         model: str,
         max_retries: int,
         total_timeout: int = 120,
+        api_base: str = None,
     ) -> tuple[list[str], list[str], str | None, str | None]:
         """执行 API 请求并处理响应，每个重试有独立的超时控制"""
 
@@ -903,7 +439,9 @@ class GeminiAPIClient:
         last_error = None
 
         session = await self._get_session()
-        timeout_cfg = aiohttp.ClientTimeout(total=total_timeout, sock_read=total_timeout)
+        timeout_cfg = aiohttp.ClientTimeout(
+            total=total_timeout, sock_read=total_timeout
+        )
 
         while current_retry < max_retries:
             try:
@@ -916,6 +454,7 @@ class GeminiAPIClient:
                     api_type,
                     model,
                     timeout=timeout_cfg,
+                    api_base=api_base,
                 )
 
             except asyncio.CancelledError:
@@ -999,6 +538,7 @@ class GeminiAPIClient:
         model: str,
         *,
         timeout: aiohttp.ClientTimeout | None = None,
+        api_base: str = None,
     ) -> tuple[list[str], list[str], str | None, str | None]:
         """执行实际的HTTP请求"""
         logger.debug(
@@ -1051,7 +591,7 @@ class GeminiAPIClient:
                 if api_type == "google":
                     return await self._parse_gresponse(response_data, session)
                 else:  # openai 兼容格式
-                    return await self._parse_openai_response(response_data, session)
+                    return await self._parse_openai_response(response_data, session, api_base)
             elif response.status in [429, 402, 403]:
                 error_msg = response_data.get("error", {}).get(
                     "message", f"HTTP {response.status}"
@@ -1131,202 +671,13 @@ class GeminiAPIClient:
         self, response_data: dict, session: aiohttp.ClientSession
     ) -> tuple[list[str], list[str], str | None, str | None]:
         """解析 Google 官方 API 响应"""
-        import asyncio
-
-        parse_start = asyncio.get_event_loop().time()
-        logger.debug("🔍 开始解析API响应数据...")
-
-        image_urls: list[str] = []
-        image_paths: list[str] = []
-        text_chunks: list[str] = []
-        thought_signature = None
-        fallback_texts = self._collect_fallback_texts(response_data)
-
-        if "candidates" not in response_data or not response_data["candidates"]:
-            logger.warning(
-                "Google 响应缺少 candidates 字段，尝试从 fallback 文本提取图像"
-            )
-            appended = False
-            if fallback_texts:
-                appended = await self._append_images_from_texts(
-                    fallback_texts, image_urls, image_paths
-                )
-            if appended and (image_urls or image_paths):
-                text_content = (
-                    " ".join(t.strip() for t in fallback_texts if t and t.strip())
-                    or None
-                )
-                return image_urls, image_paths, text_content, thought_signature
-
-            if "promptFeedback" in response_data:
-                feedback = response_data["promptFeedback"]
-                logger.warning(f"请求被阻止: {feedback}")
-            else:
-                logger.error("响应中没有 candidates，fallback 提取也失败")
-                logger.debug(f"完整响应: {str(response_data)[:1000]}")
-                logger.debug(f"fallback_texts: {fallback_texts}")
-            return [], [], None, None
-
-        candidates = response_data["candidates"]
-        logger.debug(f"📝 找到 {len(candidates)} 个候选结果")
-
-        for idx, candidate in enumerate(candidates):
-            finish_reason = candidate.get("finishReason")
-            if finish_reason in ["SAFETY", "RECITATION"]:
-                logger.warning(f"候选 {idx} 生成被阻止: {finish_reason}")
-                continue
-
-            content = candidate.get("content", {})
-            parts = content.get("parts") or []
-            logger.debug(f"📋 候选 {idx} 包含 {len(parts)} 个部分")
-
-            for i, part in enumerate(parts):
-                try:
-                    logger.debug(f"检查候选 {idx} 的第 {i} 个part: {list(part.keys())}")
-
-                    if "thoughtSignature" in part and not thought_signature:
-                        thought_signature = part["thoughtSignature"]
-                        logger.debug(f"🧠 找到思维签名: {thought_signature[:50]}...")
-
-                    # 累积文本，便于后续从文本中提取 data URI / http(s) 链接
-                    if "text" in part and isinstance(part.get("text"), str):
-                        text_chunks.append(part.get("text", ""))
-
-                    inline_data = part.get("inlineData") or part.get("inline_data")
-                    if inline_data and not part.get("thought", False):
-                        mime_type = (
-                            inline_data.get("mimeType")
-                            or inline_data.get("mime_type")
-                            or "image/png"
-                        )
-                        base64_data = inline_data.get("data", "")
-
-                        logger.debug(
-                            f"🎯 找到图像数据 (候选{idx} 第{i + 1}部分): {mime_type}, 大小: {len(base64_data)} 字符"
-                        )
-
-                        if base64_data:
-                            image_format = (
-                                mime_type.split("/")[1] if "/" in mime_type else "png"
-                            )
-
-                            logger.debug("💾 开始保存图像文件...")
-                            save_start = asyncio.get_event_loop().time()
-
-                            saved_path = await save_base64_image(
-                                base64_data, image_format
-                            )
-
-                            save_end = asyncio.get_event_loop().time()
-                            logger.debug(
-                                f"✅ 图像保存完成，耗时: {save_end - save_start:.2f}秒"
-                            )
-
-                            if saved_path:
-                                image_paths.append(saved_path)
-                                image_urls.append(saved_path)
-                            else:
-                                # 保存失败时尝试宽松解码并写入临时文件，避免误判为无图
-                                try:
-                                    import tempfile
-
-                                    tmp_path = Path(
-                                        tempfile.mktemp(
-                                            prefix="gem_inline_", suffix=".png"
-                                        )
-                                    )
-                                    cleaned = base64_data.strip().replace("\n", "")
-                                    if ";base64," in cleaned:
-                                        _, _, cleaned = cleaned.partition(";base64,")
-                                    raw = base64.b64decode(cleaned, validate=False)
-                                    tmp_path.write_bytes(raw)
-                                    image_paths.append(str(tmp_path))
-                                    image_urls.append(str(tmp_path))
-                                    logger.debug(
-                                        "⚠️ save_base64_image 失败，已使用宽松解码写入临时文件: %s",
-                                        tmp_path,
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        "候选 %s 第 %s 部分 inlineData 解码失败，跳过：%s",
-                                        idx,
-                                        i + 1,
-                                        e,
-                                    )
-                        else:
-                            logger.warning(
-                                f"候选 {idx} 的第 {i} 个part有inlineData但data为空"
-                            )
-                    elif "thought" in part and part.get("thought", False):
-                        logger.debug(f"候选 {idx} 的第 {i} 个part是思考内容")
-                    else:
-                        logger.debug(
-                            f"候选 {idx} 的第 {i} 个part不是图像也不是思考: {list(part.keys())}"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"处理候选 {idx} 的第 {i} 个part时出错: {e}", exc_info=True
-                    )
-
-        logger.debug(f"🖼️ 共找到 {len(image_paths)} 张图片")
-
-        # 文本中尝试解析可能的图像URL或Base64（用于只返回文本的情况）
-        if text_chunks:
-            extracted_urls: list[str] = []
-            extracted_paths: list[str] = []
-            for chunk in text_chunks:
-                # http(s) 图片链接
-                extracted_urls.extend(self._find_image_urls_in_text(chunk))
-                # data URI / base64
-                urls2, paths2 = await self._extract_from_content(chunk)
-                extracted_urls.extend(urls2)
-                extracted_paths.extend(paths2)
-
-            if extracted_urls or extracted_paths:
-                image_urls.extend(extracted_urls)
-                image_paths.extend(extracted_paths)
-
-        text_content = (
-            " ".join(chunk for chunk in text_chunks if chunk).strip()
-            if text_chunks
-            else None
-        )
-        if text_content:
-            logger.debug(f"🎯 找到文本内容: {text_content[:100]}...")
-
-        if not (image_paths or image_urls) and fallback_texts:
-            appended = await self._append_images_from_texts(
-                fallback_texts, image_urls, image_paths
-            )
-            if appended and not text_content:
-                text_content = (
-                    " ".join(t.strip() for t in fallback_texts if t and t.strip())
-                    or text_content
-                )
-
-        if image_paths or image_urls:
-            parse_end = asyncio.get_event_loop().time()
-            logger.debug(f"🎉 API响应解析完成，总耗时: {parse_end - parse_start:.2f}秒")
-            return image_urls, image_paths, text_content, thought_signature
-
-        if text_content:
-            logger.warning("API只返回了文本响应，未生成图像，将触发重试")
-            logger.debug(f"Google响应内容: {str(response_data)[:1000]}")
-            raise APIError(
-                f"图像生成失败：API只返回了文本响应，正在重试... | 响应预览: {str(response_data)[:300]}",
-                500,
-                "no_image_retry",
-            )
-
-        logger.warning(f"未在响应中找到图像数据，响应内容: {str(response_data)[:500]}")
-        raise APIError(
-            f"图像生成失败：响应格式异常，未找到有效的图像数据 | 响应: {str(response_data)[:300]}",
-            None,
-            "invalid_response",
+        provider = get_api_provider("google")
+        return await provider.parse_response(
+            client=self, response_data=response_data, session=session
         )
 
     async def _parse_openai_response(
-        self, response_data: dict, session: aiohttp.ClientSession
+        self, response_data: dict, session: aiohttp.ClientSession, api_base: str = None
     ) -> tuple[list[str], list[str], str | None, str | None]:
         """解析 OpenAI API 响应"""
 
@@ -1416,10 +767,38 @@ class GeminiAPIClient:
                 ):
                     image_url, image_path = await self._parse_data_uri(candidate_url)
                 elif isinstance(candidate_url, str):
+                    # grok2api 适配：处理相对路径（如 /images/xxx）
+                    if candidate_url.startswith("/") and not candidate_url.startswith("//"):
+                        if api_base:
+                            # 从 api_base 提取 scheme 和 netloc
+                            parsed_base = urllib.parse.urlparse(api_base)
+                            base_url = f"{parsed_base.scheme}://{parsed_base.netloc}"
+                            full_url = urllib.parse.urljoin(base_url, candidate_url)
+                            # grok2api 适配：立即下载临时缓存的图片（避免被清理）
+                            logger.debug(f"[grok2api 适配] 相对路径转换并下载: {candidate_url} -> {full_url}")
+                            image_url, image_path = await self._download_image(full_url, session, use_cache=False)
+                            # 只保留本地路径（_download_image 返回的两个值相同，避免重复）
+                            if image_path:
+                                image_paths.append(image_path)
+                            continue
+                        else:
+                            logger.warning(f"发现相对路径 URL 但未提供 api_base，跳过: {candidate_url}")
+                            continue
                     # 对于可访问的 http(s) 链接，直接返回 URL，避免重复下载占用带宽
                     if candidate_url.startswith("http://") or candidate_url.startswith(
                         "https://"
                     ):
+                        # grok2api 适配：检测临时缓存 URL 并强制下载（避免被清理）
+                        # 临时缓存 URL 特征：包含 /images/users- 或 /temp/image/
+                        is_temp_cache = "/images/users-" in candidate_url or "/temp/image/" in candidate_url
+                        if is_temp_cache:
+                            logger.debug(f"[grok2api 适配] 检测到临时缓存 URL，强制下载: {candidate_url}")
+                            image_url, image_path = await self._download_image(candidate_url, session, use_cache=False)
+                            # 只保留本地路径（_download_image 返回的两个值相同，避免重复）
+                            if image_path:
+                                image_paths.append(image_path)
+                            continue
+                        # 其他永久 URL 直接使用
                         image_urls.append(candidate_url)
                         logger.debug(
                             f"🖼️ OpenAI 返回可直接访问的图像链接: {candidate_url}"
@@ -1459,6 +838,11 @@ class GeminiAPIClient:
             if text_content:
                 http_urls = self._find_image_urls_in_text(text_content)
                 for url in http_urls:
+                    # grok2api 适配：跳过临时缓存 URL（已在上面下载并添加到 image_paths）
+                    is_temp_cache = "/images/users-" in url or "/temp/image/" in url
+                    if is_temp_cache:
+                        logger.debug(f"[grok2api 适配] 跳过文本中的临时缓存 URL（已下载）: {url}")
+                        continue
                     if url not in image_urls:
                         image_urls.append(url)
 
@@ -1514,6 +898,9 @@ class GeminiAPIClient:
                         image_paths.append(image_path)
 
         if image_urls or image_paths:
+            logger.info(f"[grok2api 调试] API 返回图片数量: paths={len(image_paths)}, urls={len(image_urls)}")
+            logger.info(f"[grok2api 调试] image_urls = {image_urls}")
+            logger.info(f"[grok2api 调试] image_paths = {image_paths}")
             logger.debug(
                 f"🖼️ OpenAI 收集到 {len(image_paths) or len(image_urls)} 张图片"
             )
@@ -1544,7 +931,6 @@ class GeminiAPIClient:
         logger.warning(
             f"OpenAI 响应格式不支持或未找到图像数据，响应: {str(response_data)[:500]}"
         )
-        return image_urls, image_paths, text_content, thought_signature
 
     def _normalize_message_value(self, raw_value: Any) -> dict[str, Any] | None:
         """归一化任意常见字段为标准 message 结构"""
@@ -1759,6 +1145,8 @@ class GeminiAPIClient:
         markdown_pattern = r"!\[[^\]]*\]\((https?://[^)]+)\)"
         # Markdown 图片语法中的 data URI（如 ![image](data:image/png;base64,...)）
         markdown_data_uri_pattern = r"!\[[^\]]*\]\((data:image/[^)]+)\)"
+        # grok2api 适配：支持相对路径 (如 ![image](/images/xxx))
+        markdown_relative_pattern = r"!\[[^\]]*\]\((/[^)]+|[^/:)]+/[^)]+)\)"
         raw_pattern = (
             r"(https?://[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|tiff|avif))(?:\b|$)"
         )
@@ -1769,12 +1157,19 @@ class GeminiAPIClient:
 
         def _push(candidate: str):
             cleaned = candidate.strip().replace("&amp;", "&").rstrip(").,;")
+            # grok2api 适配：移除 URL 两端的引号（单引号或双引号）
+            cleaned = cleaned.strip('\'"')
             if cleaned and cleaned not in seen:
                 seen.add(cleaned)
                 urls.append(cleaned)
 
         for pattern in (markdown_pattern, markdown_data_uri_pattern, raw_pattern):
             for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                _push(match)
+
+        # grok2api 适配：提取相对路径
+        for match in re.findall(markdown_relative_pattern, text, flags=re.IGNORECASE):
+            if not match.startswith(("http://", "https://", "data:")):
                 _push(match)
 
         # 适配带空格的 http:// 片段（如 "http: //1. 2. 3. 4/image.png"）

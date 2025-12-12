@@ -1,8 +1,8 @@
-# AstrBot Gemini 图像生成插件 v1.7.4
+# AstrBot Gemini 图像生成插件 v1.7.5
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/Version-v1.7.2-blue)
+![Version](https://img.shields.io/badge/Version-v1.7.5-blue)
 ![License](https://img.shields.io/badge/License-MIT-orange)
 
 </div>
@@ -99,7 +99,7 @@
 
 **api_settings**
 - `provider_id`：必填，从 AstrBot 提供商中选择生图模型。
-- `api_type`：可选，覆盖提供商类型（google/openai/zai）。选择 `zai` 时启用 Zai 兼容参数传递（顶层分辨率/比例 + generation_config）。
+- `api_type`：可选，覆盖提供商类型（google/openai/zai/grok2api）。选择 `zai` 时启用 Zai 兼容参数传递（顶层分辨率/比例 + generation_config）；选择 `grok2api` 时支持相对路径图片与临时缓存图片的自动下载落盘。
 - `model`：可选，覆盖提供商模型名称。
 - `vision_provider_id`：可选，切图前调用视觉模型识别网格行列；留空则跳过 AI 识别。
 
@@ -447,6 +447,10 @@
 3. 提交代码更改
 4. 发起 Pull Request
 
+### 🧩 新增 API 供应商
+
+开发者请参考：`docs/新增API供应商.md`
+
 ## 📄 许可证
 
 本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
@@ -470,6 +474,8 @@
   - [PR#6](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/6)：增加保留参考图尺寸开关，改图/换风格可沿用参考图分辨率
 - [@vmoranv](https://github.com/vmoranv)：优化表情包提示词
   - [PR#11](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/11)：优化表情包提示词
+- [@itismygo](https://github.com/itismygo)：新增 grok2api 的 OpenAI 兼容适配（相对路径/临时缓存图片链接处理）
+  - [PR#32](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/32)：支持 grok2api 的 OpenAI 兼容格式
 
 ## 🤝 关联支持
 
