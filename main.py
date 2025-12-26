@@ -614,7 +614,7 @@ class GeminiImageGenerationPlugin(Star):
         try:
             platform_name = event.get_platform_name()
             return platform_name == "aiocqhttp"
-        except Exception as e:
+        except AttributeError as e:
             logger.debug(f"判断平台类型失败: {e}")
             return False
 
