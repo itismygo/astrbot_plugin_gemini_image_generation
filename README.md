@@ -477,7 +477,8 @@
   - [PR#11](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/11)：优化表情包提示词
 - [@itismygo](https://github.com/itismygo)：新增 grok2api 的 OpenAI 兼容适配（相对路径/临时缓存图片链接处理）
   - [PR#32](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/32)：支持 grok2api 的 OpenAI 兼容格式
-
+- [@Clhikari](https://github.com/Clhikari)：修复快速生图报错
+  - [PR#37](https://github.com/piexian/astrbot_plugin_gemini_image_generation/pull/37)：修复快速生图报错
 ## 🤝 关联支持
 
 - **项目地址**: [GitHub Repository](https://github.com/piexian/astrbot_plugin_gemini_image_generation)
